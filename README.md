@@ -205,6 +205,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 | 版本 | 变更 |
 |---|---|
+| v1.14.2（2026-10-25） | 修复 Responses/Anthropic **SSE 负载缺 `data:` 前缀**（裸 JSON 行被 eventsource 解析器按未知字段丢弃、事件以空 data 派发；curl 与子串断言测不出，仅真实 eventsource 客户端暴露 —— codex 0.164 实测 `stream closed before response.completed`，经 socat 抓包 + codex-rs 源码比对定位）；Anthropic 适配层容忍 `messages` 里 `role:"system"`（Claude Code 实测形态）。修复后容器内真实 `claude` / `codex` CLI 双双端到端跑通 |
 | v1.14.1（2026-10-25） | `/v1/models` 接受 `x-api-key`（Anthropic SDK 标准形态）；鉴权失败错误形状语义固定：`/v1/messages` 系恒 Anthropic 形状（Claude Code 不总发 `anthropic-version` 头），形状分流仅用于 `/v1/models` 这一双协议共享端点 |
 | v1.14.0（2026-10-25） | 新增**多协议端点**：`/v1/responses`（OpenAI Responses，Codex 直连）与 `/v1/messages`（Anthropic Messages，Claude Code 直连，x-api-key / Bearer 双鉴权、`count_tokens` 粗估、`/v1/models` 按 `anthropic-version` 头切 Anthropic 形状）。适配层不改 chat 管道：请求转 chat 形态 + ResponseWriter 包装器实时翻译出站（SSE 帧 / 聚合 JSON / 错误 JSON），选号 / 粘性 / 熔断 / 标记修复零改动继承 |
 | v1.13.1（2026-10-25） | 修复**账号池表格整表空白**：`app.js` `rateLimitMeta` 双时钟分支（`until < reset_at`）对未声明变量 `detail` 赋值，严格模式下抛 `ReferenceError` 使 `renderAccounts` 中断、且被 `loadOverview` 的静默 catch 吞掉——任一账号挂 6004 模型级限流且命中双时钟条件即复现（统计卡正常、表格空白、无报错）。修复同时给 `TestAppJSRateLimitMeta` 沙箱补 `'use strict'` 前缀对齐浏览器真实执行环境，此类回归此后由 CI 拦截 |
