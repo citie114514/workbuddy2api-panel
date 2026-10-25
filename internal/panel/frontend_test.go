@@ -191,10 +191,14 @@ const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function dur(');
 const end = src.indexOf('function rateLimitRowsHtml');
 if (start < 0 || end < 0) throw new Error('rate limit helpers not found');
-const ctx = { Date, Number, String, Math };
-vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.rateLimitMeta=rateLimitMeta;', ctx);
-const now = new Date(2026, 8, 28, 14, 0, 0).getTime();
+	const ctx = { Date, Number, String, Math };
+	vm.createContext(ctx);
+	// 'use strict' 前缀对齐浏览器真实执行环境（app.js 顶部指令）：切片求值若不带它，
+	// 裸赋值未声明变量只会隐式建全局而不报错——v1.13.0 的 rateLimitMeta 正是这样
+	// 让账号池整表静默空白（renderAccounts 抛 ReferenceError 被 loadOverview 的
+	// quiet catch 吞掉），而本测试全绿。严格模式下这类回归会直接 FAIL。
+	vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.rateLimitMeta=rateLimitMeta;', ctx);
+	const now = new Date(2026, 8, 28, 14, 0, 0).getTime();
 const reset = new Date(2026, 8, 28, 16, 0, 0).getTime();
 const until = new Date(2026, 8, 28, 15, 0, 0).getTime();
 const rate = ctx.rateLimitMeta({ model: 'glm-5.3', kind: 'rate_limit', reset_at: new Date(reset).toISOString(), until: new Date(until).toISOString() }, now);
