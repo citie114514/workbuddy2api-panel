@@ -37,7 +37,9 @@ func newFallbackHandler(t *testing.T, modelFallbackEnabled bool, custom map[stri
 		}
 		return base.RoundTrip(r)
 	})
-	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", Realm: "global", ExpiresAt: 9999999999})
+	g := &auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}
+	auth.BackfillRealmFor(g, "global")
+	p := testPoolWith(g)
 	p.SetModelRateOf(func(realm, model string) string {
 		if model == "deepseek-v4.1-flash" {
 			return "x0.00"
