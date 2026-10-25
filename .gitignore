@@ -45,3 +45,7 @@ docs/
 *.zip
 server.exe
 .DS_Store
+codex_responses_rs.txt
+core_client_rs.txt
+sess_tel.txt
+telemetry_rs.txt
