@@ -19,20 +19,18 @@
 ---
 
 > [!IMPORTANT]
-> **项目已停止维护（2026-10-21）**：后续不再更新代码、不跟进上游变化、不再处理新的 issue / PR。
+> **继任维护声明（2026-10-25）**：本仓库是 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)（2026-10-21 停止维护）的继任 fork，自 **v1.13.1** 起由本仓库继续修复与演进。
 >
-> 原因有三：
-> 1. **上游已开始禁用反代**——WorkBuddy 对非官方客户端的识别与拦截正在收紧（通道校验、账号限制等），反代通道的稳定性与存活周期已不可控，继续做适配意义有限；
-> 2. **个人精力有限**——本项目本就是个人自用工具，无力长期跟进协议变化与风控对抗；
-> 3. **非法转卖泛滥**——发现大量批量注册小号、对外售卖额度、二次加壳 / 卡密分发的滥用行为，与本项目初衷完全相悖。
+> 前任维护者停更时指出的风险在可预见未来仍然成立，使用前请知悉：
+> 1. **上游已开始禁用反代**——WorkBuddy 对非官方客户端的识别与拦截正在收紧（通道校验、账号限制等），反代通道的稳定性与存活周期不可控，**上游随时可能彻底收紧导致本项目不可用**；
+> 2. **非法转卖泛滥**——批量注册小号、对外售卖额度、二次加壳 / 卡密分发的滥用行为与本项目初衷完全相悖，本项目**仅限自用账号**（见下方使用声明）。
 >
-> 仓库保持现状可用（已合入的修复不会回退），但请自行评估风险：**上游随时可能彻底收紧导致不可用**；因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
+> 因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
 >
-> **维护方式披露**：本仓库近期的 issue / PR 处置、代码审查、测试与修复实现**大量由 AI 辅助完成**（自动化编码 agent），合并与发布决策由维护者作出。请知悉后再使用或参与贡献。
+> **维护方式披露**：本 fork 的 issue / PR 处置、代码审查、测试与修复实现**主要由 AI 编码 agent（ZCode）完成**，合并与发布决策由仓库所有者 [@citie114514](https://github.com/citie114514) 作出。请知悉后再使用或参与贡献。
 
-> **本项目是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的增强分支**（fork）。
-> 上游仓库现已删除；本项目**已同步至上游删库前的最后一次更新**（`ea8b1e5`），此后由本分支独立维护演进。
-> 在上游基础上重构了可视化运维层；差异概览见 [与上游的差异](#-与上游的差异)，上游设计的精巧之处（账号池调度、错误分类、提示词体系）原样保留，详见下文。
+> **项目沿革**：[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)（已删库）→ [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)（面板增强分支，2026-10-21 停止维护）→ **本仓库（继任维护）**。
+> 面板分支已完整吸收 Sliverkiss 删库前的最后一次更新（`ea8b1e5`），并在其基础上重构了可视化运维层；差异概览见 [与上游的差异](#-与上游的差异)，上游设计的精巧之处（账号池调度、错误分类、提示词体系）原样保留，详见下文。
 
 > ⚠️ **本项目仅限自用账号（签到 / 保活 / 个人工具接入），不支持同时也是禁止批量小号分发额度、二次打包或收费售卖。** 详见 [使用声明（必读）](#使用声明必读)。
 
@@ -202,6 +200,12 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 > 上游仓库此后已删除，上述第二轮（`ea8b1e5`）即其**删库前的最后一次更新**，本分支已完整吸收。此后本仓库与上游不再有同步关系，演进以本仓库为准。
 
+### 本 fork（继任维护）变更
+
+| 版本 | 变更 |
+|---|---|
+| v1.13.1（2026-10-25） | 修复**账号池表格整表空白**：`app.js` `rateLimitMeta` 双时钟分支（`until < reset_at`）对未声明变量 `detail` 赋值，严格模式下抛 `ReferenceError` 使 `renderAccounts` 中断、且被 `loadOverview` 的静默 catch 吞掉——任一账号挂 6004 模型级限流且命中双时钟条件即复现（统计卡正常、表格空白、无报错）。修复同时给 `TestAppJSRateLimitMeta` 沙箱补 `'use strict'` 前缀对齐浏览器真实执行环境，此类回归此后由 CI 拦截 |
+
 ## 架构总览
 
 ```mermaid
@@ -236,7 +240,7 @@ flowchart LR
 
 ### 方式〇：GHCR 镜像（免克隆免构建）
 
-CI 会自动构建多架构镜像（`amd64` / `arm64`）并发布到 GHCR，`git clone` 之外的部署路径：
+CI 会自动构建多架构镜像（`amd64` / `arm64`）并发布到 GHCR，`git clone` 之外的部署路径（前任仓库 `ghcr.io/linguo2625469/...` 的镜像已随停更冻结，请换用本仓库地址）：
 
 ```bash
 # 1. 准备配置与数据目录
@@ -247,7 +251,7 @@ mkdir -p auths data && cp config.example.json config.json
 docker run -d --name workbuddy2api \
   -p 7863:7863 -e TZ=Asia/Shanghai \
   -v ./auths:/app/auths -v ./data:/app/data -v ./config.json:/app/config.json \
-  ghcr.io/linguo2625469/workbuddy2api-panel:latest
+  ghcr.io/citie114514/workbuddy2api-panel:latest
 
 # 3. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
@@ -263,7 +267,7 @@ curl -s http://localhost:7863/healthz
 
 ```bash
 # 1. 克隆
-git clone https://github.com/linguo2625469/workbuddy2api-panel.git
+git clone https://github.com/citie114514/workbuddy2api-panel.git
 cd workbuddy2api-panel
 
 # 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
