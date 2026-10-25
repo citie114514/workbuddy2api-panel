@@ -458,12 +458,16 @@ func estimateChatTokens(obj any) int {
 
 // withAuthAcceptAPIKey Bearer 或 x-api-key 二选一（Anthropic 客户端两种形态都发：
 // ANTHROPIC_AUTH_TOKEN → Authorization: Bearer；默认 SDK → x-api-key）。
-// 鉴权失败按请求形态选错误形状：带 anthropic-version 头（Anthropic SDK）用
-// Anthropic 形状，其余（含 /v1/models 的 OpenAI 客户端）用 OpenAI 形状。
-func (h *Handler) withAuthAcceptAPIKey(next http.HandlerFunc) http.HandlerFunc {
+//
+// anthropicShape 决定鉴权失败的错误形状：
+//   - true（/v1/messages 系）：恒 Anthropic 形状——Claude Code 不总发
+//     anthropic-version 头，不能拿头的有无判协议；
+//   - false（/v1/models 双协议共享）：按 anthropic-version 头分流，
+//     OpenAI 客户端不受影响。
+func (h *Handler) withAuthAcceptAPIKey(next http.HandlerFunc, anthropicShape bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !httpauth.VerifyBearerOrAPIKey(r, h.loadLive().APIKey) {
-			if r.Header.Get("Anthropic-Version") != "" {
+			if anthropicShape || r.Header.Get("Anthropic-Version") != "" {
 				(anthropicAdapter{}).WriteErrorDirect(w, http.StatusUnauthorized, "authentication_error",
 					"missing or invalid API key (Authorization: Bearer or x-api-key)")
 			} else {

@@ -578,7 +578,8 @@ func TestAnthropicAuthShapes(t *testing.T) {
 	if rec2.Code != 200 {
 		t.Fatalf("Bearer auth must pass, code=%d", rec2.Code)
 	}
-	// 错误 key → Anthropic 错误形状 401。
+	// 错误 key → Anthropic 错误形状 401（/v1/messages 恒 Anthropic 形状；
+	// /v1/models 的形状按 anthropic-version 头分流，见 TestModelsXAPIKeyAuth）。
 	req3 := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(
 		`{"model":"glm-5.2","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`))
 	req3.Header.Set("x-api-key", "wrong")

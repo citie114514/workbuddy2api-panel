@@ -145,12 +145,12 @@ func NewHandler(cfg Config) *Handler {
 	// Messages 原生端点，转换成 chat 形态后走同一管道（选号/粘性/治理全继承）。
 	// 注意与 /v1/search/messages（低仿 Anthropic 形态的检索端点）无关。
 	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responsesEndpoint))
-	h.mux.HandleFunc("POST /v1/messages", h.withAuthAcceptAPIKey(h.anthropicMessages))
-	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withAuthAcceptAPIKey(h.anthropicCountTokens))
+	h.mux.HandleFunc("POST /v1/messages", h.withAuthAcceptAPIKey(h.anthropicMessages, true))
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withAuthAcceptAPIKey(h.anthropicCountTokens, true))
 	// 联网搜索（Anthropic Messages 兼容形态，见 messages.go）。路径刻意不占用
 	// /v1/messages——那是 Anthropic 模型对话的标准路径，留给未来的 chat 转发。
 	h.mux.HandleFunc("POST /v1/search/messages", h.withAuth(h.messages))
-	h.mux.HandleFunc("GET /v1/models", h.withAuthAcceptAPIKey(h.models))
+	h.mux.HandleFunc("GET /v1/models", h.withAuthAcceptAPIKey(h.models, false))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
