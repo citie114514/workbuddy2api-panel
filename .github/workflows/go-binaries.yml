@@ -133,12 +133,26 @@ jobs:
         run: |
           PREV=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
           echo "prev=${PREV}" >> "$GITHUB_OUTPUT"
+      # 更新日志正文从 CHANGELOG.md 提取对应章节（"## vX.Y.Z" 起头，下一个 "## " 结尾）。
+      # 章节缺失（忘写/旧 tag 重发）时兜底为原通用模板，保证发布永不因缺章节而失败。
+      - name: 组装更新日志（CHANGELOG.md 章节）
+        run: |
+          if [ -f CHANGELOG.md ]; then
+            awk -v start="## ${GITHUB_REF_NAME}" \
+              'index($0, start) == 1 { flag = 1; next } flag && /^## / { exit } flag { print }' \
+              CHANGELOG.md > release-notes.md
+          fi
+          if [ ! -s release-notes.md ]; then
+            {
+              echo "CI 自动构建发布（五平台二进制 + checksums）。"
+              echo ""
+              echo "完整变更：https://github.com/${{ github.repository }}/compare/${{ steps.prev.outputs.prev }}...${{ github.ref_name }}"
+            } > release-notes.md
+          fi
+          cat release-notes.md
       - uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}-panel
           prerelease: ${{ contains(github.ref_name, '-') }}
-          body: |
-            CI 自动构建发布（五平台二进制 + checksums）。
-
-            完整变更：https://github.com/${{ github.repository }}/compare/${{ steps.prev.outputs.prev }}...${{ github.ref_name }}
+          body_path: release-notes.md
           files: dist/*

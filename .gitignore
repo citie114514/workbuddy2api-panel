@@ -34,6 +34,8 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+# CHANGELOG.md 是 Release 正文的数据源（go-binaries.yml 发布时提取对应章节），必须进库
+!CHANGELOG.md
 
 # Windows binaries
 /wb2api.exe
