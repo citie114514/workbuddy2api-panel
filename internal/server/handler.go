@@ -141,6 +141,12 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	// v1.14.0 协议适配层（proto_adapter.go）：OpenAI Responses 与 Anthropic
+	// Messages 原生端点，转换成 chat 形态后走同一管道（选号/粘性/治理全继承）。
+	// 注意与 /v1/search/messages（低仿 Anthropic 形态的检索端点）无关。
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responsesEndpoint))
+	h.mux.HandleFunc("POST /v1/messages", h.withAuthAcceptAPIKey(h.anthropicMessages))
+	h.mux.HandleFunc("POST /v1/messages/count_tokens", h.withAuthAcceptAPIKey(h.anthropicCountTokens))
 	// 联网搜索（Anthropic Messages 兼容形态，见 messages.go）。路径刻意不占用
 	// /v1/messages——那是 Anthropic 模型对话的标准路径，留给未来的 chat 转发。
 	h.mux.HandleFunc("POST /v1/search/messages", h.withAuth(h.messages))
@@ -307,6 +313,29 @@ const (
 // models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
 // 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	// Anthropic SDK 的 /v1/models 是另一套响应形状（v1.14.0）：带 anthropic-version
+	// 头即按其形态应答，同一份模型数据两种协议共用。无该头保持 OpenAI 形状（零回归）。
+	if r.Header.Get("Anthropic-Version") != "" {
+		entries := h.modelList()
+		data := make([]any, 0, len(entries))
+		var first, last string
+		for i, e := range entries {
+			id, _ := e["id"].(string)
+			if i == 0 {
+				first = id
+			}
+			last = id
+			item := map[string]any{"type": "model", "id": id, "display_name": id}
+			if d, ok := e["description"].(string); ok {
+				item["display_name"] = d
+			}
+			data = append(data, item)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"data": data, "first_id": first, "has_more": false, "last_id": last,
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
 		"data":   h.modelList(),

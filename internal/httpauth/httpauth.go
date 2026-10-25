@@ -36,6 +36,26 @@ func VerifyBearer(r *http.Request, key string) bool {
 	return subtle.ConstantTimeCompare(digest(tok), digest(key)) == 1
 }
 
+// VerifyBearerOrAPIKey Bearer 或 x-api-key 二选一校验（/v1/messages 系端点用）。
+//
+// Anthropic 客户端两种凭据形态都存在：ANTHROPIC_AUTH_TOKEN → `Authorization:
+// Bearer`（Claude Code 的推荐方式），默认 SDK 凭据 → `x-api-key`。两条路径都走
+// 同一套摘要常量时间比较；缺头侧仍做一次哑比较，保持耗时形状一致。
+func VerifyBearerOrAPIKey(r *http.Request, key string) bool {
+	if key == "" {
+		return true
+	}
+	if VerifyBearer(r, key) {
+		return true
+	}
+	tok := r.Header.Get("X-Api-Key")
+	if tok == "" {
+		subtle.ConstantTimeCompare(digest(""), digest(key))
+		return false
+	}
+	return subtle.ConstantTimeCompare(digest(tok), digest(key)) == 1
+}
+
 // digest 返回 s 的 SHA-256（定长 32 字节，供常量时间比较）。
 func digest(s string) []byte {
 	sum := sha256.Sum256([]byte(s))
