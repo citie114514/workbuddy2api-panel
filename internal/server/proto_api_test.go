@@ -111,13 +111,13 @@ func TestResponsesRequestInputString(t *testing.T) {
 }
 
 func TestResponsesRequestValidation(t *testing.T) {
-	if _, perr := responsesAdapter{}.ConvertRequest([]byte(`{"input":"x"}`)); perr == nil || perr.status != http.StatusBadRequest {
+	if _, perr := (responsesAdapter{}).ConvertRequest([]byte(`{"input":"x"}`)); perr == nil || perr.status != http.StatusBadRequest {
 		t.Errorf("missing model must 400, got %+v", perr)
 	}
-	if _, perr := responsesAdapter{}.ConvertRequest([]byte(`{"model":"m"}`)); perr == nil || perr.status != http.StatusBadRequest {
+	if _, perr := (responsesAdapter{}).ConvertRequest([]byte(`{"model":"m"}`)); perr == nil || perr.status != http.StatusBadRequest {
 		t.Errorf("missing input must 400, got %+v", perr)
 	}
-	if _, perr := responsesAdapter{}.ConvertRequest([]byte(`not-json`)); perr == nil {
+	if _, perr := (responsesAdapter{}).ConvertRequest([]byte(`not-json`)); perr == nil {
 		t.Error("bad JSON must 400")
 	}
 }
@@ -316,10 +316,10 @@ func TestAnthropicRequestConversion(t *testing.T) {
 }
 
 func TestAnthropicRequestValidation(t *testing.T) {
-	if _, perr := anthropicAdapter{}.ConvertRequest([]byte(`{"model":"m"}`)); perr == nil || perr.typ != "invalid_request_error" {
+	if _, perr := (anthropicAdapter{}).ConvertRequest([]byte(`{"model":"m"}`)); perr == nil || perr.typ != "invalid_request_error" {
 		t.Errorf("missing max_tokens must 400 invalid_request_error, got %+v", perr)
 	}
-	if _, perr := anthropicAdapter{}.ConvertRequest([]byte(`{"max_tokens":10}`)); perr == nil {
+	if _, perr := (anthropicAdapter{}).ConvertRequest([]byte(`{"max_tokens":10}`)); perr == nil {
 		t.Error("missing model must 400")
 	}
 	// tool_result-only 的 user 消息：拆出 tool 消息后不得残留空壳 user。
