@@ -477,10 +477,8 @@ func TestResponsesEndpointStream(t *testing.T) {
 	}
 	// SSE 规范：负载必须在 data: 字段（裸 JSON 行会被 eventsource 解析器丢弃，
 	// codex 实测报 stream closed before response.completed —— v1.14.1 实案）。
-	if !strings.Contains(body, "event: response.created
-data: ") {
-		t.Errorf("event payload must be on data: line:
-%.300s", body)
+	if !strings.Contains(body, "event: response.created\ndata: ") {
+		t.Errorf("event payload must be on data: line:\n%.300s", body)
 	}
 }
 
@@ -534,10 +532,8 @@ func TestAnthropicEndpointStream(t *testing.T) {
 	if strings.Contains(body, "data: [DONE]") {
 		t.Error("Anthropic stream must not carry chat-style [DONE]")
 	}
-	if !strings.Contains(body, "event: message_start
-data: ") {
-		t.Errorf("event payload must be on data: line:
-%.300s", body)
+	if !strings.Contains(body, "event: message_start\ndata: ") {
+		t.Errorf("event payload must be on data: line:\n%.300s", body)
 	}
 }
 
