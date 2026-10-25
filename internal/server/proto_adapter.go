@@ -151,6 +151,11 @@ func (p *protoResponseWriter) feed(b []byte) {
 }
 
 // emit 写出若干目标协议事件（event 名 + data JSON），逐事件 flush。
+//
+// data 负载必须写进 "data:" 字段（SSE 规范）：此前裸写 JSON 行被 eventsource
+// 解析器当未知字段丢弃、事件以空 data 派发 —— codex 0.164 的 SSE 消费层因此
+// 收不到任何事件，报 "stream closed before response.completed"（v1.14.1 实案）。
+// curl / 子串断言都测不出这类错误，只有真实 eventsource 客户端会暴露。
 func (p *protoResponseWriter) emit(events []sseEvent) {
 	for _, ev := range events {
 		data, err := json.Marshal(ev.data)
@@ -161,6 +166,7 @@ func (p *protoResponseWriter) emit(events []sseEvent) {
 		if ev.name != "" {
 			buf.WriteString("event: " + ev.name + "\n")
 		}
+		buf.WriteString("data: ")
 		buf.Write(data)
 		buf.WriteString("\n\n")
 		_, _ = p.real.Write(buf.Bytes())

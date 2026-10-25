@@ -86,10 +86,12 @@ func anthropicReqToChat(req *anthropicRequest) ([]byte, *protoAPIError) {
 	callSeq := 0
 	for _, m := range req.Messages {
 		role := m.Role
-		if role != "user" && role != "assistant" {
+		if role != "user" && role != "assistant" && role != "system" {
 			return nil, &protoAPIError{status: http.StatusBadRequest, typ: "invalid_request_error",
 				msg: fmt.Sprintf("messages: roles must alternatively be 'user' or 'assistant', got %q", role)}
 		}
+		// 容忍 role:"system" 消息（Claude Code 实测会这样发，尽管 Anthropic 规范
+		// 要求 system 走顶层参数）：chat 形态本就支持 system 角色，原样透传。
 		var blocks []map[string]any
 		if err := json.Unmarshal(m.Content, &blocks); err != nil {
 			// content 允许是裸字符串。

@@ -475,6 +475,13 @@ func TestResponsesEndpointStream(t *testing.T) {
 	if strings.Contains(body, "data: [DONE]") {
 		t.Error("Responses stream must not carry chat-style [DONE]")
 	}
+	// SSE 规范：负载必须在 data: 字段（裸 JSON 行会被 eventsource 解析器丢弃，
+	// codex 实测报 stream closed before response.completed —— v1.14.1 实案）。
+	if !strings.Contains(body, "event: response.created
+data: ") {
+		t.Errorf("event payload must be on data: line:
+%.300s", body)
+	}
 }
 
 func TestResponsesEndpointNonStream(t *testing.T) {
@@ -526,6 +533,11 @@ func TestAnthropicEndpointStream(t *testing.T) {
 	}
 	if strings.Contains(body, "data: [DONE]") {
 		t.Error("Anthropic stream must not carry chat-style [DONE]")
+	}
+	if !strings.Contains(body, "event: message_start
+data: ") {
+		t.Errorf("event payload must be on data: line:
+%.300s", body)
 	}
 }
 
@@ -591,6 +603,27 @@ func TestAnthropicAuthShapes(t *testing.T) {
 	var eobj map[string]any
 	if err := json.Unmarshal(rec3.Body.Bytes(), &eobj); err != nil || eobj["type"] != "error" {
 		t.Errorf("error shape: %s", rec3.Body)
+	}
+}
+
+// TestAnthropicSystemRoleMessage Claude Code 实测会在 messages 里发 role:"system"
+//（尽管规范要求 system 走顶层参数）：必须容忍并透传为 chat system 消息。
+func TestAnthropicSystemRoleMessage(t *testing.T) {
+	body, perr := (anthropicAdapter{}).ConvertRequest([]byte(`{"model":"m","max_tokens":9,"messages":[
+		{"role":"system","content":"be brief"},
+		{"role":"user","content":"hi"}]}`))
+	if perr != nil {
+		t.Fatalf("system role must be accepted: %+v", perr)
+	}
+	var got map[string]any
+	_ = json.Unmarshal(body, &got)
+	msgs, _ := got["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("messages=%v", msgs)
+	}
+	m0, _ := msgs[0].(map[string]any)
+	if m0["role"] != "system" {
+		t.Errorf("first message role=%v want system", msgs[0])
 	}
 }
 
