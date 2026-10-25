@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>把腾讯 CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关 · 附 Web 管理面板</b><br>
-  Web 面板 · OAuth 浏览器登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时签到 / 活跃 / 旅行 / 保活 · <b>成长任务一键完成（17/18）</b> · 流式 / 非流式
+  Web 面板 · OAuth 浏览器登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时签到 / 活跃 / 旅行 / 保活 · <b>成长任务一键完成（17/18）</b> · 流式 / 非流式 · OpenAI Responses / Anthropic Messages 原生端点
 </p>
 
 <p align="center">
@@ -67,6 +67,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 | 能力 | 说明 |
 |---|---|
+| 🔌 **多协议端点** | 除 `/v1/chat/completions` 外，原生提供 **`/v1/responses`**（OpenAI Responses，Codex 直连）与 **`/v1/messages`**（Anthropic Messages，Claude Code 直连，含 `count_tokens`）：请求转 chat 形态走同一管道，选号 / 粘性 / 熔断 / 用量统计全继承，无需外层协议转换器 |
 | 🔑 **OAuth 一键登录** | `login.sh` 设备授权流程，自动落盘凭证并重启容器加载新账号 |
 | 🔄 **多账号池** | 快过期积分加权 + 成本分层 + 加权随机选号，Top-5 候选 + 防惊群 |
 | 🛡️ **熔断与冷却** | 429 软冷却 600s 起指数退避（封顶 `soft_rate_max`）、404 固定 60s 短冷却、402 硬冷却至次日 04:00、连续失败熔断、在途租约限流 |
@@ -204,6 +205,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 | 版本 | 变更 |
 |---|---|
+| v1.14.0（2026-10-25） | 新增**多协议端点**：`/v1/responses`（OpenAI Responses，Codex 直连）与 `/v1/messages`（Anthropic Messages，Claude Code 直连，x-api-key / Bearer 双鉴权、`count_tokens` 粗估、`/v1/models` 按 `anthropic-version` 头切 Anthropic 形状）。适配层不改 chat 管道：请求转 chat 形态 + ResponseWriter 包装器实时翻译出站（SSE 帧 / 聚合 JSON / 错误 JSON），选号 / 粘性 / 熔断 / 标记修复零改动继承 |
 | v1.13.1（2026-10-25） | 修复**账号池表格整表空白**：`app.js` `rateLimitMeta` 双时钟分支（`until < reset_at`）对未声明变量 `detail` 赋值，严格模式下抛 `ReferenceError` 使 `renderAccounts` 中断、且被 `loadOverview` 的静默 catch 吞掉——任一账号挂 6004 模型级限流且命中双时钟条件即复现（统计卡正常、表格空白、无报错）。修复同时给 `TestAppJSRateLimitMeta` 沙箱补 `'use strict'` 前缀对齐浏览器真实执行环境，此类回归此后由 CI 拦截 |
 
 ## 架构总览
@@ -370,6 +372,33 @@ curl -s http://localhost:7863/v1/search/messages \
   -d '{"model":"deepseek-v4-flash","tools":[{"type":"web_search_20250305","name":"web_search"}],
        "messages":[{"role":"user","content":"Perform a web search for the query: OpenAI 最新模型"}]}'
 ```
+
+### 多协议端点（v1.14.0+）：Codex / Claude Code 直连
+
+网关原生提供 OpenAI Responses 与 Anthropic Messages 端点，客户端**无需外层协议转换器**
+（此前 new-api / ccswitch 那一层可以去掉；`tools` 声明也不再经过会丢声明的中转环节）：
+
+```bash
+# OpenAI Responses（Codex CLI 等）
+#   Codex: config.toml 里 model_provider 指向网关，wire_api = "responses"
+curl -sN http://localhost:7863/v1/responses \
+  -H "Authorization: Bearer your-api-key" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","input":"hi","stream":true}'
+
+# Anthropic Messages（Claude Code 等）
+#   Claude Code: ANTHROPIC_BASE_URL=http://<host>:7863 ANTHROPIC_AUTH_TOKEN=your-api-key
+#   （或 ANTHROPIC_API_KEY，走 x-api-key 头）；模型名需设为网关透出的名字，
+#   如 ANTHROPIC_MODEL=deepseek-v4-flash
+curl -sN http://localhost:7863/v1/messages \
+  -H "x-api-key: your-api-key" -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4-flash","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
+支持面：instructions / system、文本与图片、function 工具与 tool_use / tool_result
+回放、`reasoning.effort`、`max_output_tokens` / `max_tokens`、流式与非流式、
+错误按目标协议形状返回。模型名不映射——客户端需直接使用网关模型名
+（`/v1/models` 可查；Anthropic SDK 调用时网关按 `anthropic-version` 头返回 Anthropic 列表形状）。
 
 ## 配置说明
 
