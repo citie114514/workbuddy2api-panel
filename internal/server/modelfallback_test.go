@@ -4,7 +4,6 @@ package server
 // 模型级阻塞时，选号改用付费兄弟型号（-sg）重选一次 —— 对齐官方客户端行为。
 
 import (
-	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -132,8 +131,8 @@ func TestChatFallbackTargetAlsoBlocked(t *testing.T) {
 	if seen.Load() != nil {
 		t.Errorf("blocked sibling must not hit upstream, model=%v", seen.Load())
 	}
-	// 仍应是主模型的阻塞快照（回退没成功不改写错误口径）。
-	if !bytes.Contains(rec.Body.Bytes(), []byte("deepseek-v4.1-flash")) {
-		t.Errorf("blocked reason should reference the model: %s", rec.Body)
+	// 回退没成功不改写错误口径：hint 仍是模型级阻塞计数 + 上游 6004 原因。
+	if !strings.Contains(rec.Body.String(), "6004 model rate limit") {
+		t.Errorf("blocked reason should carry upstream reason: %s", rec.Body)
 	}
 }
