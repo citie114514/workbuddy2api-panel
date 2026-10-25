@@ -271,8 +271,10 @@ func TestMessagesSearchUpstreamErrorShape(t *testing.T) {
 	}
 }
 
-// TestMessagesRouteDoesNotShadowV1Messages 断言搜索端点没有占用 /v1/messages
-// （该路径保留给 Anthropic 模型对话）。
+// TestMessagesRouteDoesNotShadowV1Messages 断言搜索端点没有占用 /v1/messages。
+// v1.14.0 起 /v1/messages 由 Anthropic Messages 适配层接管（该路径此前正是
+// 为模型对话保留）：空对象应得到 Anthropic 形态的 400（缺 max_tokens），
+// 且不得打搜索上游。
 func TestMessagesRouteDoesNotShadowV1Messages(t *testing.T) {
 	up := newSearchUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Error("不得打上游")
@@ -283,8 +285,11 @@ func TestMessagesRouteDoesNotShadowV1Messages(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{}`)))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("POST /v1/messages code=%d want 404（该路径留给模型对话）", rec.Code)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("POST /v1/messages code=%d want 400（Anthropic 形态校验错误）", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"type":"error"`) {
+		t.Errorf("body 必须是 Anthropic 错误形状: %s", rec.Body)
 	}
 }
 

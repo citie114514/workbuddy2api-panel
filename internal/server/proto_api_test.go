@@ -19,6 +19,22 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
+// asNum 兼容取数：转换层直出的 map 里是 Go int（未经 JSON 往返），
+// 经 recorder body 反序列化的是 float64。两种形态都合法，统一按数取。
+func asNum(t *testing.T, v any) float64 {
+	t.Helper()
+	switch n := v.(type) {
+	case float64:
+		return n
+	case int:
+		return float64(n)
+	case int64:
+		return float64(n)
+	}
+	t.Fatalf("not a number: %v (%T)", v, v)
+	return 0
+}
+
 // ── Responses：请求转换 ─────────────────────────────────────────────────
 
 func TestResponsesRequestConversion(t *testing.T) {
@@ -145,7 +161,7 @@ func TestResponsesJSONResponse(t *testing.T) {
 		t.Errorf("function_call item: %v", fc)
 	}
 	usage, _ := obj["usage"].(map[string]any)
-	if usage["input_tokens"].(float64) != 3 || usage["output_tokens"].(float64) != 5 || usage["total_tokens"].(float64) != 8 {
+	if asNum(t, usage["input_tokens"]) != 3 || asNum(t, usage["output_tokens"]) != 5 || asNum(t, usage["total_tokens"]) != 8 {
 		t.Errorf("usage: %v", usage)
 	}
 }
@@ -213,7 +229,7 @@ func TestResponsesStreamTranslator(t *testing.T) {
 	}
 	resp, _ := completedData["response"].(map[string]any)
 	usage, _ := resp["usage"].(map[string]any)
-	if usage["input_tokens"].(float64) != 2 || usage["output_tokens"].(float64) != 3 {
+	if asNum(t, usage["input_tokens"]) != 2 || asNum(t, usage["output_tokens"]) != 3 {
 		t.Errorf("completed usage: %v", usage)
 	}
 	out, _ := resp["output"].([]any)
@@ -361,7 +377,7 @@ func TestAnthropicJSONResponseToolUse(t *testing.T) {
 		t.Errorf("tool input: %v", input)
 	}
 	usage, _ := obj["usage"].(map[string]any)
-	if usage["input_tokens"].(float64) != 4 || usage["output_tokens"].(float64) != 6 {
+	if asNum(t, usage["input_tokens"]) != 4 || asNum(t, usage["output_tokens"]) != 6 {
 		t.Errorf("usage: %v", usage)
 	}
 }
@@ -403,7 +419,7 @@ func TestAnthropicStreamTranslator(t *testing.T) {
 		t.Errorf("stop_reason=%v want tool_use", delta["stop_reason"])
 	}
 	usage, _ := deltaEv["usage"].(map[string]any)
-	if usage["output_tokens"].(float64) != 3 {
+	if asNum(t, usage["output_tokens"]) != 3 {
 		t.Errorf("output_tokens=%v want 3", usage)
 	}
 }
