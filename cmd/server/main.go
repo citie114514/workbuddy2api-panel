@@ -32,7 +32,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.14.2-panel"
+const appVersion = "1.15.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -105,6 +105,7 @@ func main() {
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring)
 	p.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback) // 裸名跨域回退（issue #135，默认关闭）
+	p.SetModelFallback(cfg.Pool.ModelFallbackEnabled, cfg.Pool.ModelFallback) // 模型付费回退（v1.15，默认开启）
 	_ = p.SetScheduling(cfg.Pool.Strategy, cfg.Pool.AccountOrder)
 
 	// 会话粘性路由（可配关闭）。
@@ -537,6 +538,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
 	p.SetCrossDomainFallback(newCfg.Pool.CrossDomainFallback) // 裸名跨域回退热生效（issue #135）
+	p.SetModelFallback(newCfg.Pool.ModelFallbackEnabled, newCfg.Pool.ModelFallback) // 模型付费回退热生效（v1.15）
 	_ = p.SetScheduling(newCfg.Pool.Strategy, newCfg.Pool.AccountOrder)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(

@@ -240,6 +240,16 @@ type Config struct {
 		// 另一域再选一次；显式 cn:/global: 前缀不受影响，行为与引入前完全一致。
 		// 语义取舍：跨域会消耗另一个域的额度，属策略选择，故默认关闭、显式开启。
 		CrossDomainFallback bool `json:"cross_domain_fallback"`
+		// ModelFallbackEnabled 模型付费回退开关（v1.15），默认 true。
+		// 对齐官方客户端行为：免费额度型模型（如 global:deepseek-v4.1-flash，x0.00）
+		// 额度用尽后上游报 6004 模型级限流，官方客户端此时自动切到同名付费兄弟型号
+		// （deepseek-v4.1-flash-sg，x0.03）继续可用。开启后网关在「整个池子对该模型
+		// 模型级阻塞」时改用回退型号重选一次；请求被计费按回退型号的真实倍率。
+		// 内置规则 = 同域 "<model>-sg" 且上游目录存在该型号；显式映射可覆盖/扩展。
+		ModelFallbackEnabled bool `json:"model_fallback_enabled"`
+		// ModelFallback 自定义回退映射（键 "realm:model"，值同域目标裸模型名），
+		// 优先于内置 "-sg" 规则；值为空串或等于原模型 = 显式禁用该模型的回退。
+		ModelFallback map[string]string `json:"model_fallback"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -329,6 +339,9 @@ func Default() *Config {
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
+	// 模型付费回退默认开启（对齐官方客户端：免费额度用尽自动切付费兄弟型号，
+	// v1.15）。键缺席时保留 true，显式 false 才关。
+	c.Pool.ModelFallbackEnabled = true
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"

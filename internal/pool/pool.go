@@ -64,6 +64,13 @@ type Pool struct {
 	// 仅由选号调用方（server handler）读取：开启后，未带 realm 前缀的请求在首选域
 	// 选不到可用号时改用另一域再选一次；显式 cn:/global: 前缀不受影响。
 	crossDomainFallback bool
+	// modelFallbackEnabled 模型付费回退开关（默认 true = 对齐官方客户端，v1.15）。
+	// 模型级阻塞（6004 免费额度用尽等）且存在付费兄弟型号时，选号侧改用回退型号
+	// 重选一次；语义见 ModelFallbackTarget。
+	modelFallbackEnabled bool
+	// modelFallbackCustom 自定义回退映射（"realm:model" → 同域目标裸模型名），
+	// 优先于内置 "-sg" 规则；值空串/等于原模型 = 显式禁用该模型回退。
+	modelFallbackCustom map[string]string
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
@@ -214,6 +221,50 @@ func (p *Pool) CrossDomainFallback() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.crossDomainFallback
+}
+
+// SetModelFallback 注入模型付费回退配置（v1.15）：开关 + 自定义映射。main 从
+// config 解析后调用，配置热更走同一条路径（与 SetCrossDomainFallback 同风格）。
+// custom 为 nil/空 = 只用内置 "-sg" 规则。
+func (p *Pool) SetModelFallback(enabled bool, custom map[string]string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.modelFallbackEnabled = enabled
+	p.modelFallbackCustom = custom
+}
+
+// ModelFallbackTarget 返回模型级阻塞时的回退型号（同域裸名）与是否回退。
+//
+// 语义对齐官方客户端：免费额度型模型额度用尽后上游报 6004 模型级限流，客户端
+// 自动切到同名付费兄弟型号继续可用（global:deepseek-v4.1-flash → -sg，x0.00 →
+// x0.03）。解析顺序：
+//  1. 开关关闭 → 恒不回退；
+//  2. 自定义映射命中（键 "realm:model"）→ 用映射值；值空串或等于原模型 = 显式禁用；
+//  3. 内置规则：同域 "<model>-sg" 且上游目录确有该型号（modelRateOf 有倍率条目，
+//     不存在的型号不瞎撞）。
+//
+// 调用方（server handler）拿到非空 target 后自行确认可服务性（ServableForModelRealm）
+// 并改写出站 body 的 model 字段。
+func (p *Pool) ModelFallbackTarget(realm, model string) (string, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if !p.modelFallbackEnabled || model == "" {
+		return "", false
+	}
+	if t, ok := p.modelFallbackCustom[realm+":"+model]; ok {
+		if t == "" || t == model {
+			return "", false
+		}
+		return t, true
+	}
+	fb := model + "-sg"
+	if fb == model || p.modelRateOf == nil {
+		return "", false
+	}
+	if p.modelRateOf(realm, fb) == "" {
+		return "", false
+	}
+	return fb, true
 }
 
 // SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。

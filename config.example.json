@@ -95,7 +95,11 @@
     "expiring_soon": "168h",
     "cost_explore_interval": "30m",
     "credit_floor": 100,
-    "cross_domain_fallback": false
+    "cross_domain_fallback": false,
+    "model_fallback_enabled": true,
+    "model_fallback": {
+      "global:deepseek-v4.1-flash": "deepseek-v4.1-flash-sg"
+    }
   },
   "session_sticky": {
     "enabled": true,

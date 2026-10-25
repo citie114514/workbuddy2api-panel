@@ -645,6 +645,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
 	// 默认零值 Blocked=false = 按既有的"没有可用账号"口径报错。
 	var modelBlock pool.ModelBlockStatus
+	// fallbackTried 模型付费回退只做一次（v1.15）：免费额度型 6004 → 付费兄弟型号
+	// （如 global:deepseek-v4.1-flash → -sg）。回退型号再阻塞就走既有 model_blocked
+	// 错误口径，不做 "-sg-sg" 链式递归。
+	fallbackTried := false
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
@@ -872,6 +876,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 两者此前都报 no_healthy_account，导致「模型不可用」被读成「号全挂了」。
 			// 在这里取一次快照，供下方错误构造区分（issue #102 附带发现 1）。
 			modelBlock = h.cfg.Pool.ModelBlockedForRealm(bareModel, realm)
+			// 模型付费回退（v1.15，默认开启）：模型级阻塞（典型=免费额度型 6004 额度
+			// 用尽）且存在付费兄弟型号时，对齐官方客户端改用回退型号重选一次 ——
+			// global:deepseek-v4.1-flash 被全池 6004 锁住时官方客户端就是切到
+			// -sg（x0.03）继续用的。回退型号也阻塞 → 走既有 model_blocked 口径。
+			if modelBlock.Blocked && !fallbackTried {
+				if fb, ok := h.cfg.Pool.ModelFallbackTarget(realm, bareModel); ok &&
+					h.cfg.Pool.ServableForModelRealm(fb, realm) > 0 {
+					log.Printf("INFO: [server] model fallback acct_pool=%s model=%s -> %s (all accounts model-blocked: %s)",
+						realm, bareModel, fb, strings.TrimSpace(modelBlock.Reason))
+					fallbackTried = true
+					body = rewriteModel(body, fb)
+					bareModel = fb
+					st.model = fb // 流水行展示实际服务的模型，而不是请求里写的那个
+					if h.cfg.Upstream != nil {
+						modelRate = h.cfg.Upstream.ModelRate(realm, fb)
+					}
+					tried = map[string]bool{} // 主模型的失败记录（6004 罚的是模型不是号）清空，全池重选
+					modelBlock = pool.ModelBlockStatus{}
+					continue
+				}
+			}
 			break
 		}
 		st.uid = acct.UID
