@@ -385,25 +385,29 @@ func TestAnthropicJSONResponseToolUse(t *testing.T) {
 func TestAnthropicStreamTranslator(t *testing.T) {
 	s := anthropicAdapter{}.NewStream("glm-5.2")
 	var names []string
-	var lastEvents []sseEvent
-	for _, f := range responsesTestFrames() {
-		evs := s.Frame([]byte(f))
+	var dataBuf strings.Builder
+	appendEvents := func(evs []sseEvent) {
 		for _, ev := range evs {
 			names = append(names, ev.name)
+			if raw, err := json.Marshal(ev.data); err == nil {
+				dataBuf.Write(raw)
+			}
 		}
 	}
-	lastEvents = s.Close()
-	for _, ev := range lastEvents {
-		names = append(names, ev.name)
+	for _, f := range responsesTestFrames() {
+		appendEvents(s.Frame([]byte(f)))
 	}
+	lastEvents := s.Close()
+	appendEvents(lastEvents)
+	dataAll := dataBuf.String()
 	join := strings.Join(names, ",")
 	for _, want := range []string{"message_start", "ping", "content_block_start", "content_block_delta", "message_delta", "message_stop"} {
 		if !strings.Contains(join, want) {
 			t.Errorf("missing event %s in %s", want, join)
 		}
 	}
-	if strings.Contains(join, "input_json_delta") == false {
-		t.Errorf("tool argument deltas must map to input_json_delta: %s", join)
+	if !strings.Contains(dataAll, "input_json_delta") {
+		t.Errorf("tool argument deltas must map to input_json_delta: %s / %s", join, dataAll)
 	}
 	var deltaEv map[string]any
 	for _, ev := range lastEvents {
@@ -549,7 +553,13 @@ func TestAnthropicEndpointNonStream(t *testing.T) {
 }
 
 func TestAnthropicAuthShapes(t *testing.T) {
-	h := newProtoTestHandler(t, 200, sseOK)
+	// 显式配置 APIKey：默认空串 = 鉴权关闭，wrong-key 用例就失去意义。
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+		APIKey:   "test",
+	})
 	// x-api-key 通过。
 	req := httptest.NewRequest("POST", "/v1/messages", strings.NewReader(
 		`{"model":"glm-5.2","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`))
