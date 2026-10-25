@@ -673,3 +673,33 @@ func TestProtoWriterJSONErrorTranslation(t *testing.T) {
 		t.Errorf("message lost: %s", rec.Body)
 	}
 }
+
+// TestModelsXAPIKeyAuth Anthropic SDK 用 x-api-key 调 /v1/models（标准形态）：
+// 必须与 Bearer 等效通过，且返回 Anthropic 形状。
+func TestModelsXAPIKeyAuth(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+		APIKey:   "test",
+	})
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("x-api-key", "test")
+	req.Header.Set("anthropic-version", "2023-06-01")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("x-api-key must pass on /v1/models, code=%d body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), `"has_more"`) {
+		t.Errorf("must be anthropic shape: %s", rec.Body)
+	}
+	// 无 anthropic-version 的错误 key → OpenAI 形状 401（不误用 Anthropic 形状）。
+	req2 := httptest.NewRequest("GET", "/v1/models", nil)
+	req2.Header.Set("Authorization", "Bearer wrong")
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	if rec2.Code != 401 || strings.Contains(rec2.Body.String(), `"type":"error"`) {
+		t.Errorf("openai-shape 401 expected, code=%d body=%s", rec2.Code, rec2.Body)
+	}
+}
