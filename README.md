@@ -205,6 +205,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 | 版本 | 变更 |
 |---|---|
+| v1.16.0（2026-10-25） | 修复 Responses / Anthropic 适配层**吞思维链与缓存计量**：/v1/messages 补 thinking 块（thinking_delta + signature 占位）与 `usage.cache_read/cache_creation_input_tokens`；/v1/responses 补 reasoning 输出项（受 `reasoning.summary` 控制）与 `output_tokens_details.reasoning_tokens`、`input_tokens_details.cached_tokens`；chat 路径本来就全、不动 |
 | v1.15.0（2026-10-25） | 新增**模型付费回退**（默认开启）：免费额度型模型额度用尽后上游报 6004 模型级限流，官方客户端此时自动切到同名付费兄弟型号（`global:deepseek-v4.1-flash` x0.00 → `-sg` x0.03）继续可用；网关对齐 —— 模型级阻塞且目录存在 `-sg` 型号时改用回退型号重选一次，计费按回退型号真实倍率。`pool.model_fallback_enabled` 开关 + `pool.model_fallback` 自定义映射（键 `"realm:model"`，值空串=禁用该模型回退），热生效 |
 | v1.14.2（2026-10-25） | 修复 Responses/Anthropic **SSE 负载缺 `data:` 前缀**（裸 JSON 行被 eventsource 解析器按未知字段丢弃、事件以空 data 派发；curl 与子串断言测不出，仅真实 eventsource 客户端暴露 —— codex 0.164 实测 `stream closed before response.completed`，经 socat 抓包 + codex-rs 源码比对定位）；Anthropic 适配层容忍 `messages` 里 `role:"system"`（Claude Code 实测形态）。修复后容器内真实 `claude` / `codex` CLI 双双端到端跑通 |
 | v1.14.1（2026-10-25） | `/v1/models` 接受 `x-api-key`（Anthropic SDK 标准形态）；鉴权失败错误形状语义固定：`/v1/messages` 系恒 Anthropic 形状（Claude Code 不总发 `anthropic-version` 头），形状分流仅用于 `/v1/models` 这一双协议共享端点 |

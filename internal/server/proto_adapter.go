@@ -35,6 +35,9 @@ type chatStreamTranslator interface {
 
 // protoAdapter 一个目标协议的完整适配器。
 type protoAdapter interface {
+	// forRequest 返回请求级适配器实例：从原始请求解析影响出站形态的选项
+	// （如 Responses 的 reasoning.summary）。无请求级状态的适配器返回自身。
+	forRequest(raw []byte) protoAdapter
 	// ConvertRequest 目标协议请求体 → chat 请求体。
 	ConvertRequest(raw []byte) ([]byte, *protoAPIError)
 	// JSONResponse chat 聚合 JSON（status 200）→ 目标协议响应对象。
@@ -213,10 +216,18 @@ type chatToolDelta struct {
 }
 
 // chatUsageInfo usage 帧的 token 计数。
+// reasoning = completion_tokens_details.reasoning_tokens（缺省回落 completion_thinking_tokens），
+// cachedRead/cachedWrite = prompt_cache_hit_tokens / prompt_cache_write_tokens
+// （别名 cache_read_input_tokens / cache_creation_input_tokens 兜底）。
+// 加和口径（实测）：total = prompt + completion，thinking 已计入 completion。
 type chatUsageInfo struct {
 	prompt     int
 	completion int
 	total      int
+	reasoning  int
+	thinking   int
+	cachedRead  int
+	cachedWrite int
 }
 
 // chatFrameError 上游 error 帧 / 错误 JSON 的标准形状。
@@ -232,10 +243,36 @@ type chatChunk struct {
 	id        string
 	model     string
 	content   string
+	reasoning string
 	toolCalls []chatToolDelta
 	finish    string
 	usage     *chatUsageInfo
 	err       *chatFrameError
+}
+
+// parseUsageInfo 从 usage map（normalizeUsageCacheAliases 后的形态）提取计数。
+func parseUsageInfo(u map[string]any) *chatUsageInfo {
+	ui := &chatUsageInfo{
+		prompt:     int(numOf2int(u["prompt_tokens"])),
+		completion: int(numOf2int(u["completion_tokens"])),
+		total:      int(numOf2int(u["total_tokens"])),
+		thinking:   int(numOf2int(u["completion_thinking_tokens"])),
+		cachedRead: int(numOf2int(u["prompt_cache_hit_tokens"])),
+		cachedWrite: int(numOf2int(u["prompt_cache_write_tokens"])),
+	}
+	if ui.cachedRead == 0 {
+		ui.cachedRead = int(numOf2int(u["cache_read_input_tokens"]))
+	}
+	if ui.cachedWrite == 0 {
+		ui.cachedWrite = int(numOf2int(u["cache_creation_input_tokens"]))
+	}
+	if details, ok := u["completion_tokens_details"].(map[string]any); ok {
+		ui.reasoning = int(numOf2int(details["reasoning_tokens"]))
+	}
+	if ui.reasoning == 0 {
+		ui.reasoning = ui.thinking
+	}
+	return ui
 }
 
 // parseChatChunk 解析一帧 chat SSE payload；非 JSON / 空 JSON 返回 nil。
@@ -258,11 +295,7 @@ func parseChatChunk(payload []byte) *chatChunk {
 		return c
 	}
 	if u, ok := obj["usage"].(map[string]any); ok {
-		c.usage = &chatUsageInfo{
-			prompt:     int(numOf2int(u["prompt_tokens"])),
-			completion: int(numOf2int(u["completion_tokens"])),
-			total:      int(numOf2int(u["total_tokens"])),
-		}
+		c.usage = parseUsageInfo(u)
 	}
 	if chs, ok := obj["choices"].([]any); ok && len(chs) > 0 {
 		ch, _ := chs[0].(map[string]any)
@@ -270,6 +303,7 @@ func parseChatChunk(payload []byte) *chatChunk {
 			c.finish, _ = ch["finish_reason"].(string)
 			if d, ok := ch["delta"].(map[string]any); ok {
 				c.content, _ = d["content"].(string)
+				c.reasoning, _ = d["reasoning_content"].(string)
 				if tcs, ok := d["tool_calls"].([]any); ok {
 					for _, raw := range tcs {
 						tc, _ := raw.(map[string]any)
@@ -296,6 +330,7 @@ type chatCompletion struct {
 	id        string
 	model     string
 	content   string
+	reasoning string
 	toolCalls []chatToolDelta
 	finish    string
 	usage     *chatUsageInfo
@@ -311,11 +346,7 @@ func parseChatCompletion(body []byte) *chatCompletion {
 	c.id, _ = obj["id"].(string)
 	c.model, _ = obj["model"].(string)
 	if u, ok := obj["usage"].(map[string]any); ok {
-		c.usage = &chatUsageInfo{
-			prompt:     int(numOf2int(u["prompt_tokens"])),
-			completion: int(numOf2int(u["completion_tokens"])),
-			total:      int(numOf2int(u["total_tokens"])),
-		}
+		c.usage = parseUsageInfo(u)
 	}
 	if chs, ok := obj["choices"].([]any); ok && len(chs) > 0 {
 		ch, _ := chs[0].(map[string]any)
@@ -325,6 +356,7 @@ func parseChatCompletion(body []byte) *chatCompletion {
 		c.finish, _ = ch["finish_reason"].(string)
 		if msg, ok := ch["message"].(map[string]any); ok {
 			c.content, _ = msg["content"].(string)
+			c.reasoning, _ = msg["reasoning_content"].(string)
 			if tcs, ok := msg["tool_calls"].([]any); ok {
 				for _, raw := range tcs {
 					tc, _ := raw.(map[string]any)
@@ -382,6 +414,7 @@ func (h *Handler) serveChatViaAdapter(w http.ResponseWriter, r *http.Request, ad
 		ad.WriteErrorDirect(w, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error())
 		return
 	}
+	ad = ad.forRequest(raw) // 请求级状态（如 reasoning.summary）供流式/非流式翻译共用
 	chatBody, perr := ad.ConvertRequest(raw)
 	if perr != nil {
 		ad.WriteErrorDirect(w, perr.status, perr.typ, perr.msg)

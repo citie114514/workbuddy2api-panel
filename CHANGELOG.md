@@ -3,6 +3,26 @@
 本文件是 GitHub Release 正文的数据源：打 `v*` tag 发版时，CI 自动提取对应章节写入发行说明。
 格式：`## vX.Y.Z（日期）` 起头，下一个 `## ` 结尾。新版本发版前在文件顶部追加章节。
 
+## v1.16.0（2026-10-25）
+
+### 修复：/v1/responses 与 /v1/messages 透出思维链与缓存计量（计量失真修复）
+
+三路对照实测（同一网关同一模型）：chat 路径明明白白报 `reasoning_content`、`completion_thinking_tokens`、`prompt_cache_hit_tokens`，而 Responses / Anthropic 两条适配路径把 reasoning 与缓存字段全部吞掉 —— `reasoning_tokens` 恒 0、`cached_tokens` 恒 0，Codex / Claude Code 里看到的用量与成本偏小，DeepSeek 前缀缓存省下的钱完全看不见。上游把一切都给了，是适配层翻译 schema 时漏字段。
+
+**/v1/messages（Anthropic）**：
+
+- 思维链以 thinking 块透出：`content_block_start {type:"thinking"}` + `thinking_delta` 增量，关块补 `signature_delta`（空串占位 —— 入站侧丢弃 thinking，无可验签名场景）；text / thinking / tool_use 三类块互斥自动切换
+- `usage.cache_read_input_tokens` ← `prompt_cache_hit_tokens`、`usage.cache_creation_input_tokens` ← `prompt_cache_write_tokens`（流式随 `message_delta` 下发，非流式随顶层 usage）
+- `output_tokens` 透传 `completion_tokens`（实测口径 total = prompt + completion，thinking 已计入，无需另加）
+
+**/v1/responses（OpenAI Responses）**：
+
+- `output[]` 补 `{"type":"reasoning","summary":[{"type":"summary_text",...}]}`（思维链原样作为 summary 透出）；流式对应 `reasoning_summary_part.added → reasoning_summary_text.delta → …done` 事件序列；**是否输出由请求的 `reasoning.summary` 决定**（`none` / 缺省不发，对齐官方语义）
+- `usage.output_tokens_details.reasoning_tokens` ← `completion_tokens_details.reasoning_tokens`
+- `usage.input_tokens_details.cached_tokens` ← `prompt_cache_hit_tokens`
+
+**/v1/chat/completions** 不动（已经是全的）。适配层新增请求级状态（`forRequest`）：stream 翻译器与非流式翻译共享请求的 summary 设置。
+
 ## v1.15.0（2026-10-25）
 
 ### 模型付费回退：免费额度用尽自动切付费兄弟型号（默认开启）

@@ -37,7 +37,33 @@ func nextResponsesID(prefix string) string {
 }
 
 // responsesAdapter Responses ↔ chat 适配器。
-type responsesAdapter struct{}
+// responsesAdapter Responses ↔ chat 适配器。summary 为请求级状态（forRequest 从
+// 原始请求的 reasoning.summary 解析），决定思维链是否以 reasoning 输出项透出：
+// 非 "none" 且非空才发（none / 缺省 = 不发，对齐官方语义）。
+type responsesAdapter struct {
+	summary string
+}
+
+// forRequest 解析 reasoning.summary；其余字段 ConvertRequest 自己再解析一遍
+//（解析成本可忽略，保持两个入口各自独立）。
+func (a responsesAdapter) forRequest(raw []byte) protoAdapter {
+	var peek struct {
+		Reasoning *struct {
+			Summary string `json:"summary"`
+		} `json:"reasoning"`
+	}
+	_ = json.Unmarshal(raw, &peek)
+	sum := ""
+	if peek.Reasoning != nil {
+		sum = strings.ToLower(strings.TrimSpace(peek.Reasoning.Summary))
+	}
+	return responsesAdapter{summary: sum}
+}
+
+// summaryEnabled 报告是否应把上游思维链以 reasoning 输出项透出。
+func (a responsesAdapter) summaryEnabled() bool {
+	return a.summary != "" && a.summary != "none"
+}
 
 // ── 请求转换 ────────────────────────────────────────────────────────────
 
@@ -297,13 +323,22 @@ func (a responsesAdapter) JSONResponse(chat []byte) any {
 
 // buildResponseObject 从标准化的 chat 完成形态构造 Responses 响应对象。
 // incomplete：finish == "length" 时置 true（status / incomplete_details 跟随）。
-func (responsesAdapter) buildResponseObject(cc *chatCompletion, streamFinal bool) map[string]any {
+// reasoning：summary 开启且上游给了 reasoning_content 时，作为首个输出项透出
+//（官方 Responses 语义里 reasoning item 先于 message）。
+func (a responsesAdapter) buildResponseObject(cc *chatCompletion, streamFinal bool) map[string]any {
 	id := cc.id
 	if id == "" {
 		id = nextResponsesID("resp")
 	}
 	output := make([]any, 0, 2)
 	var textOut strings.Builder
+	if a.summaryEnabled() && cc.reasoning != "" {
+		output = append(output, map[string]any{
+			"id": "rs_0", "type": "reasoning", "summary": []any{
+				map[string]any{"type": "summary_text", "text": cc.reasoning},
+			},
+		})
+	}
 	if cc.content != "" {
 		textOut.WriteString(cc.content)
 		output = append(output, map[string]any{
@@ -334,6 +369,12 @@ func (responsesAdapter) buildResponseObject(cc *chatCompletion, streamFinal bool
 		usage["input_tokens"] = cc.usage.prompt
 		usage["output_tokens"] = cc.usage.completion
 		usage["total_tokens"] = cc.usage.total
+		if details, ok := usage["input_tokens_details"].(map[string]any); ok {
+			details["cached_tokens"] = cc.usage.cachedRead
+		}
+		if details, ok := usage["output_tokens_details"].(map[string]any); ok {
+			details["reasoning_tokens"] = cc.usage.reasoning
+		}
 	}
 	return map[string]any{
 		"id": id, "object": "response", "created_at": time.Now().Unix(),
@@ -385,12 +426,20 @@ type responsesStream struct {
 	respID    string
 	createdAt int64
 	started   bool
+	summary   string // 请求级 reasoning.summary（见 responsesAdapter.forRequest）
 
 	nextOutput int
 	textOpen   bool
 	textItemID string
 	textOutputIndex int
 	textBuf    strings.Builder
+
+	// reasoning 输出项（summary 开启时把上游 reasoning_content 透出为
+	// reasoning item + summary_text 增量；官方形态里先于 message 项）。
+	reasoningOpen        bool
+	reasoningItemID      string
+	reasoningOutputIndex int
+	reasoningBuf         strings.Builder
 
 	tools    map[int]*respToolState
 	toolKeys []int
@@ -402,13 +451,19 @@ type responsesStream struct {
 	finishSeen string
 }
 
-func (responsesAdapter) NewStream(model string) chatStreamTranslator {
+func (a responsesAdapter) NewStream(model string) chatStreamTranslator {
 	return &responsesStream{
 		model:     model,
 		respID:    nextResponsesID("resp"),
 		createdAt: time.Now().Unix(),
+		summary:   a.summary,
 		tools:     map[int]*respToolState{},
 	}
+}
+
+// summaryEnabled 同适配器侧口径（流内复制一份，Close 组装 completed 时用）。
+func (s *responsesStream) summaryEnabled() bool {
+	return s.summary != "" && s.summary != "none"
 }
 
 func (s *responsesStream) Frame(payload []byte) []sseEvent {
@@ -441,8 +496,38 @@ func (s *responsesStream) Frame(payload []byte) []sseEvent {
 	if ch.usage != nil {
 		s.usage = ch.usage
 	}
+	// 思维链先行：上游 reasoning_content 先于正文，作为 reasoning 输出项透出
+	//（受请求 reasoning.summary 控制，none/缺省不发）。
+	if ch.reasoning != "" && s.summaryEnabled() {
+		if s.textOpen {
+			events = append(events, s.closeTextItem()...)
+		}
+		if !s.reasoningOpen {
+			s.reasoningOpen = true
+			s.reasoningItemID = fmt.Sprintf("rs_%d", s.nextOutput)
+			s.reasoningOutputIndex = s.nextOutput
+			s.nextOutput++
+			s.reasoningBuf.Reset()
+			events = append(events,
+				sseEvent{"response.output_item.added", map[string]any{
+					"type": "response.output_item.added", "output_index": s.reasoningOutputIndex,
+					"item": map[string]any{"id": s.reasoningItemID, "type": "reasoning", "summary": []any{}},
+				}},
+				sseEvent{"response.reasoning_summary_part.added", map[string]any{
+					"type": "response.reasoning_summary_part.added", "item_id": s.reasoningItemID,
+					"output_index": s.reasoningOutputIndex, "summary_index": 0,
+					"part": map[string]any{"type": "summary_text", "text": ""},
+				}})
+		}
+		s.reasoningBuf.WriteString(ch.reasoning)
+		events = append(events, sseEvent{"response.reasoning_summary_text.delta", map[string]any{
+			"type": "response.reasoning_summary_text.delta", "item_id": s.reasoningItemID,
+			"output_index": s.reasoningOutputIndex, "summary_index": 0, "delta": ch.reasoning,
+		}})
+	}
 	if ch.content != "" {
 		if !s.textOpen {
+			events = append(events, s.closeReasoningItem()...)
 			s.textOpen = true
 			s.textItemID = fmt.Sprintf("msg_%d", s.nextOutput)
 			s.textOutputIndex = s.nextOutput
@@ -547,12 +632,41 @@ func (s *responsesStream) textIndexOf() int {
 	return s.textOutputIndex
 }
 
+// closeReasoningItem 关闭进行中的 reasoning 输出项（若无则空）：
+// summary_text.done → part.done → output_item.done（item.summary 带全文）。
+func (s *responsesStream) closeReasoningItem() []sseEvent {
+	if !s.reasoningOpen {
+		return nil
+	}
+	s.reasoningOpen = false
+	full := s.reasoningBuf.String()
+	return []sseEvent{
+		{"response.reasoning_summary_text.done", map[string]any{
+			"type": "response.reasoning_summary_text.done", "item_id": s.reasoningItemID,
+			"output_index": s.reasoningOutputIndex, "summary_index": 0, "text": full,
+		}},
+		{"response.reasoning_summary_part.done", map[string]any{
+			"type": "response.reasoning_summary_part.done", "item_id": s.reasoningItemID,
+			"output_index": s.reasoningOutputIndex, "summary_index": 0,
+			"part": map[string]any{"type": "summary_text", "text": full},
+		}},
+		{"response.output_item.done", map[string]any{
+			"type": "response.output_item.done", "output_index": s.reasoningOutputIndex,
+			"item": map[string]any{
+				"id": s.reasoningItemID, "type": "reasoning",
+				"summary": []any{map[string]any{"type": "summary_text", "text": full}},
+			},
+		}},
+	}
+}
+
 // closeItems 关闭全部开启的输出项（finish 帧调用；幂等）。
 func (s *responsesStream) closeItems() []sseEvent {
 	if s.itemsDone {
 		return nil
 	}
 	var events []sseEvent
+	events = append(events, s.closeReasoningItem()...)
 	events = append(events, s.closeTextItem()...)
 	for _, k := range s.toolKeys {
 		st := s.tools[k]
@@ -594,6 +708,7 @@ func (s *responsesStream) Close() []sseEvent {
 		model:     s.model,
 		finish:    s.finishSeen,
 		usage:     s.usage,
+		reasoning: s.reasoningBuf.String(),
 	}
 	if s.textBuf.Len() > 0 {
 		cc.content = s.textBuf.String()
@@ -606,7 +721,7 @@ func (s *responsesStream) Close() []sseEvent {
 		}
 		cc.toolCalls = append(cc.toolCalls, chatToolDelta{id: st.callID, name: st.name, arguments: args})
 	}
-	resp := responsesAdapter{}.buildResponseObject(cc, true)
+	resp := responsesAdapter{summary: s.summary}.buildResponseObject(cc, true)
 	resp["id"] = s.respID
 	resp["created_at"] = s.createdAt
 	events = append(events, sseEvent{"response.completed", map[string]any{

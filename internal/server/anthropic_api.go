@@ -23,6 +23,10 @@ import (
 // anthropicAdapter Anthropic Messages ↔ chat 适配器。
 type anthropicAdapter struct{}
 
+// forRequest 无请求级状态（thinking 块有无取决于上游是否发 reasoning_content），
+// 返回自身。
+func (a anthropicAdapter) forRequest(raw []byte) protoAdapter { return a }
+
 // ── 请求转换 ────────────────────────────────────────────────────────────
 
 // anthropicRequest 只声明网关关心的字段。
@@ -302,6 +306,13 @@ func (anthropicAdapter) JSONResponse(chat []byte) any {
 		return map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": "unparseable upstream response"}}
 	}
 	content := make([]any, 0, 2)
+	// thinking 块：上游 reasoning_content 原样透出（signature 占位空串 —— 网关
+	// 不回传客户端思维链供续写，入站侧本就丢弃 thinking 块，签名无需可验）。
+	if cc.reasoning != "" {
+		content = append(content, map[string]any{
+			"type": "thinking", "thinking": cc.reasoning, "signature": "",
+		})
+	}
 	if cc.content != "" {
 		content = append(content, map[string]any{"type": "text", "text": cc.content})
 	}
@@ -330,10 +341,15 @@ func (anthropicAdapter) JSONResponse(chat []byte) any {
 	if len(content) == 0 {
 		content = append(content, map[string]any{"type": "text", "text": ""})
 	}
+	// usage：cache_read_input_tokens ← prompt_cache_hit_tokens、
+	// cache_creation_input_tokens ← prompt_cache_write_tokens；
+	// output_tokens = completion_tokens（实测口径已含 thinking token）。
 	usage := map[string]any{"input_tokens": 0, "output_tokens": 0}
 	if cc.usage != nil {
 		usage["input_tokens"] = cc.usage.prompt
 		usage["output_tokens"] = cc.usage.completion
+		usage["cache_read_input_tokens"] = cc.usage.cachedRead
+		usage["cache_creation_input_tokens"] = cc.usage.cachedWrite
 	}
 	return map[string]any{
 		"id": nextResponsesID("msg"), "type": "message", "role": "assistant",
@@ -408,11 +424,19 @@ type anthropicStream struct {
 	textIndex  int
 	textBuf    strings.Builder
 
+	// thinking 块（上游 reasoning_content → thinking_delta）：与文本块互斥开启，
+	// 切换时先关当前块。signature 以空串占位（入站侧丢弃 thinking，无可验签名场景）。
+	reasoningOpen bool
+	reasoningIndex int
+	reasoningBuf   strings.Builder
+
 	tools    map[int]*anthToolState
 	toolKeys []int
 
-	usageIn  int
-	usageOut int
+	usageIn   int
+	usageOut  int
+	cacheRead  int
+	cacheWrite int
 	finish   string
 	failed   bool
 	stopped  bool
@@ -464,9 +488,32 @@ func (s *anthropicStream) Frame(payload []byte) []sseEvent {
 	}
 	if ch.usage != nil {
 		s.usageIn, s.usageOut = ch.usage.prompt, ch.usage.completion
+		s.cacheRead, s.cacheWrite = ch.usage.cachedRead, ch.usage.cachedWrite
+	}
+	// 思维链先行：上游 reasoning_content 先于正文流出，先处理 thinking 再处理 text。
+	if ch.reasoning != "" {
+		if s.textOpen {
+			events = append(events, s.closeTextBlock()...)
+		}
+		if !s.reasoningOpen {
+			s.reasoningOpen = true
+			s.reasoningIndex = s.nextBlock
+			s.nextBlock++
+			s.reasoningBuf.Reset()
+			events = append(events, sseEvent{"content_block_start", map[string]any{
+				"type": "content_block_start", "index": s.reasoningIndex,
+				"content_block": map[string]any{"type": "thinking", "thinking": ""},
+			}})
+		}
+		s.reasoningBuf.WriteString(ch.reasoning)
+		events = append(events, sseEvent{"content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": s.reasoningIndex,
+			"delta": map[string]any{"type": "thinking_delta", "thinking": ch.reasoning},
+		}})
 	}
 	if ch.content != "" {
 		if !s.textOpen {
+			events = append(events, s.closeReasoningBlock()...)
 			s.textOpen = true
 			s.textIndex = s.nextBlock
 			s.nextBlock++
@@ -497,6 +544,7 @@ func (s *anthropicStream) Frame(payload []byte) []sseEvent {
 			st.name = td.name
 		}
 		if !st.opened {
+			events = append(events, s.closeReasoningBlock()...)
 			events = append(events, s.closeTextBlock()...)
 			st.opened = true
 			events = append(events, sseEvent{"content_block_start", map[string]any{
@@ -529,13 +577,32 @@ func (s *anthropicStream) closeTextBlock() []sseEvent {
 	}}}
 }
 
+// closeReasoningBlock 关闭进行中的 thinking 块：先补 signature_delta（空串占位，
+// Anthropic 形态要求 thinking 块以签名收尾），再 content_block_stop。
+func (s *anthropicStream) closeReasoningBlock() []sseEvent {
+	if !s.reasoningOpen {
+		return nil
+	}
+	s.reasoningOpen = false
+	return []sseEvent{
+		{"content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": s.reasoningIndex,
+			"delta": map[string]any{"type": "signature_delta", "signature": ""},
+		}},
+		{"content_block_stop", map[string]any{
+			"type": "content_block_stop", "index": s.reasoningIndex,
+		}},
+	}
+}
+
 // Close 流结束：关闭未关的块，message_delta + message_stop（幂等）。
 func (s *anthropicStream) Close() []sseEvent {
 	if s.stopped || s.failed {
 		return nil
 	}
 	s.stopped = true
-	events := s.closeTextBlock()
+	events := s.closeReasoningBlock()
+	events = append(events, s.closeTextBlock()...)
 	for _, k := range s.toolKeys {
 		st := s.tools[k]
 		if !st.closed {
@@ -545,11 +612,19 @@ func (s *anthropicStream) Close() []sseEvent {
 			}})
 		}
 	}
+	deltaUsage := map[string]any{"output_tokens": s.usageOut}
+	if s.usageIn > 0 || s.cacheRead > 0 || s.cacheWrite > 0 {
+		// usage 帧只在流尾出现，缓存计量在这里随 message_delta 下发
+		//（message_start 时上游还没给 usage，只能全零）。
+		deltaUsage["input_tokens"] = s.usageIn
+		deltaUsage["cache_read_input_tokens"] = s.cacheRead
+		deltaUsage["cache_creation_input_tokens"] = s.cacheWrite
+	}
 	events = append(events,
 		sseEvent{"message_delta", map[string]any{
 			"type": "message_delta",
 			"delta": map[string]any{"stop_reason": anthropicStopReason(s.finish), "stop_sequence": nil},
-			"usage": map[string]any{"output_tokens": s.usageOut},
+			"usage": deltaUsage,
 		}},
 		sseEvent{"message_stop", map[string]any{"type": "message_stop"}})
 	return events
