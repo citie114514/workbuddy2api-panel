@@ -11,7 +11,6 @@ package server
 // 断言一律走解析后的事件 map（Go map 序列化按键排序，子串顺序匹配会误判）。
 
 import (
-	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -47,8 +46,8 @@ func evMap(t *testing.T, ev sseEvent) map[string]any {
 //（thinking_delta 增量 + 关块时 signature_delta 占位），正文前自动关块。
 func TestAnthropicStreamThinking(t *testing.T) {
 	events := runReasoningStream((anthropicAdapter{}).NewStream("glm-5.2"))
-	sawThinkingStart, sawThinkingDelta, sawSignature := false, false, false
-	thinkingStartIdx, textStartIdx, stopBeforeText := -1, -1, false
+	sawThinkingStart, sawThinkingDelta, sawSignature, sawTextStart := false, false, false, false
+	thinkingStartIdx, stopBeforeText := -1, false
 	for i, ev := range events {
 		if ev.name != "content_block_start" && ev.name != "content_block_delta" && ev.name != "content_block_stop" {
 			continue
@@ -64,7 +63,6 @@ func TestAnthropicStreamThinking(t *testing.T) {
 				thinkingStartIdx = i
 			case "text":
 				sawTextStart = true
-				textStartIdx = i
 				if thinkingStartIdx >= 0 {
 					for _, prev := range events[thinkingStartIdx+1 : i] {
 						if prev.name == "content_block_stop" {
