@@ -3,6 +3,15 @@
 本文件是 GitHub Release 正文的数据源：打 `v*` tag 发版时，CI 自动提取对应章节写入发行说明。
 格式：`## vX.Y.Z（日期）` 起头，下一个 `## ` 结尾。新版本发版前在文件顶部追加章节。
 
+## v1.16.1（2026-10-27）
+
+### 修复：工具结果里的图片被字符串化 / 丢弃（Codex 看图成本修复）
+
+- **/v1/responses**：`function_call_output` 的 `output` 为数组时，此前整体 `json.Marshal` 成文本 —— 图片 data URL 变成百万 token 级的文本垃圾、模型根本看不到图。现在逐块分流：`input_image` / `input_image_url` 片段按图片区块透传（data URL 入 `image_url`，`image_url` 的 string / `{url}` 对象 / 顶层 `url` 键三种形态都收），`input_text` / `output_text` 转 text，未知片段按 JSON 文本兜底；字符串形态零回归
+- **/v1/messages**：`tool_result` 里的图片块（base64 source）此前被静默丢弃（Claude Code 截图类工具结果模型看不到），现在同样转 `image_url` data URL 透传；单一文本块保持裸字符串折叠
+
+效果：Codex / Claude Code 看图成本从约百万 token/张降到正常图片计量。
+
 ## v1.16.0（2026-10-25）
 
 ### 修复：/v1/responses 与 /v1/messages 透出思维链与缓存计量（计量失真修复）

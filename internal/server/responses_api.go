@@ -244,16 +244,7 @@ func responsesInputToMessages(input json.RawMessage) ([]any, *protoAPIError) {
 			appendAssistantToolCall(callID, name, args)
 		case "function_call_output":
 			callID, _ := it["call_id"].(string)
-			output := it["output"]
-			switch o := output.(type) {
-			case string:
-			case nil:
-				output = ""
-			default:
-				raw, _ := json.Marshal(o)
-				output = string(raw)
-			}
-			msgs = append(msgs, map[string]any{"role": "tool", "tool_call_id": callID, "content": output})
+			msgs = append(msgs, map[string]any{"role": "tool", "tool_call_id": callID, "content": responsesToolOutputToChat(it["output"])})
 		case "reasoning", "item_reference":
 			// 思考片段与引用项：出站侧已剔除，回放侧同样跳过。
 		default:
@@ -263,9 +254,78 @@ func responsesInputToMessages(input json.RawMessage) ([]any, *protoAPIError) {
 	return msgs, nil
 }
 
+// responsesToolOutputToChat function_call_output 的 output → chat tool 消息的 content。
+//
+// output 合法形态是字符串或输出内容块数组。数组形态必须逐块分流：input_image /
+// input_image_url 片段按图片区块透传（data URL 直接入 image_url），文本片段转 text
+// —— 整体 json.Marshal 成字符串会把图片变成百万 token 级的 data URL 文本垃圾，
+// 且模型根本看不到图（Codex 截图类工具的实案）。未知片段按其 JSON 文本兜底。
+func responsesToolOutputToChat(output any) any {
+	switch o := output.(type) {
+	case nil:
+		return ""
+	case string:
+		return o
+	case []any:
+		type piece struct {
+			kind string
+			body map[string]any
+		}
+		var pieces []piece
+		for _, raw := range o {
+			part, ok := raw.(map[string]any)
+			if !ok {
+				if s, ok := raw.(string); ok {
+					pieces = append(pieces, piece{"text", map[string]any{"type": "text", "text": s}})
+				}
+				continue
+			}
+			switch t, _ := part["type"].(string); t {
+			case "input_image", "input_image_url":
+				// image_url 字段三种形态都收：string / {url} 对象 / 顶层 url 键。
+				var url string
+				switch v := part["image_url"].(type) {
+				case string:
+					url = v
+				case map[string]any:
+					url, _ = v["url"].(string)
+				}
+				if url == "" {
+					url, _ = part["url"].(string)
+				}
+				if url == "" {
+					continue
+				}
+				pieces = append(pieces, piece{"image", map[string]any{
+					"type": "image_url", "image_url": map[string]any{"url": url},
+				}})
+			case "input_text", "output_text", "text", "":
+				text, _ := part["text"].(string)
+				pieces = append(pieces, piece{"text", map[string]any{"type": "text", "text": text}})
+			default:
+				rawJSON, _ := json.Marshal(part)
+				pieces = append(pieces, piece{"text", map[string]any{"type": "text", "text": string(rawJSON)}})
+			}
+		}
+		if len(pieces) == 0 {
+			return ""
+		}
+		if len(pieces) == 1 && pieces[0].kind == "text" {
+			return pieces[0].body["text"]
+		}
+		out := make([]any, len(pieces))
+		for i, p := range pieces {
+			out[i] = p.body
+		}
+		return out
+	default:
+		raw, _ := json.Marshal(o)
+		return string(raw)
+	}
+}
+
 // responsesContentToChat message 项的 content（string 或片段数组）→ chat content。
-// 单一文本片段折叠为裸字符串（对上游最友好），多片段保持数组形态。
-func responsesContentToChat(content any) any {
+// 单一文本片段折叠为裸字符串（对上游最友好），多片段保持数组形态。func responsesContentToChat(content any) any {
 	parts, ok := content.([]any)
 	if !ok {
 		if s, ok := content.(string); ok {

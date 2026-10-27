@@ -145,7 +145,7 @@ func anthropicReqToChat(req *anthropicRequest) ([]byte, *protoAPIError) {
 			tuID, _ := tr["tool_use_id"].(string)
 			msgs = append(msgs, map[string]any{
 				"role": "tool", "tool_call_id": tuID,
-				"content": anthropicFlattenResultContent(tr["content"]),
+				"content": anthropicResultContent(tr["content"]),
 			})
 		}
 		switch {
@@ -259,9 +259,10 @@ func anthropicSystemText(raw json.RawMessage) string {
 	return ""
 }
 
-// anthropicFlattenResultContent tool_result.content（string / 块数组）→ chat 的
-// content 字符串（文本块拼接；图片以占位符注明，v1 不转发结果内图片）。
-func anthropicFlattenResultContent(content any) string {
+// anthropicResultContent tool_result.content（string / 块数组）→ chat 的 content。
+// 文本块转 text，图片块（base64 source）转 image_url data URL 透传 —— 此前图片被
+// 静默丢弃，Claude Code 的截图类工具结果模型根本看不到。单一文本折叠为裸字符串。
+func anthropicResultContent(content any) any {
 	blocks, ok := content.([]any)
 	if !ok {
 		if s, ok := content.(string); ok {
@@ -269,19 +270,46 @@ func anthropicFlattenResultContent(content any) string {
 		}
 		return ""
 	}
-	parts := make([]string, 0, len(blocks))
+	type piece struct {
+		kind string
+		body map[string]any
+	}
+	var pieces []piece
 	for _, raw := range blocks {
 		b, _ := raw.(map[string]any)
 		if b == nil {
 			continue
 		}
-		if t, _ := b["type"].(string); t == "text" || t == "" {
+		switch t, _ := b["type"].(string); t {
+		case "text", "":
 			if text, _ := b["text"].(string); text != "" {
-				parts = append(parts, text)
+				pieces = append(pieces, piece{"text", map[string]any{"type": "text", "text": text}})
+			}
+		case "image":
+			if src, ok := b["source"].(map[string]any); ok && src["type"] == "base64" {
+				mt, _ := src["media_type"].(string)
+				data, _ := src["data"].(string)
+				if data != "" {
+					pieces = append(pieces, piece{"image", map[string]any{
+						"type":      "image_url",
+						"image_url": map[string]any{"url": "data:" + mt + ";base64," + data},
+					}})
+				}
 			}
 		}
 	}
-	return strings.Join(parts, "\n")
+	if len(pieces) == 0 {
+		return ""
+	}
+	if len(pieces) == 1 && pieces[0].kind == "text" {
+		return pieces[0].body["text"]
+	}
+	out := make([]any, len(pieces))
+	for i, p := range pieces {
+		out[i] = p.body
+	}
+	return out
+}
 }
 
 // ── 非流式响应转换 ──────────────────────────────────────────────────────
