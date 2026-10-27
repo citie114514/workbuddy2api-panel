@@ -430,7 +430,7 @@ func normalizeToolChoice(obj map[string]any) {
 // `\_`（转义的字面量下划线）会整体拒收：400 code=11129 invalid_function_call_
 // parameters（displayMsg「工具定义不合规」）。`\_` 不是任何正则文法的合法转义，
 // 但所有主流引擎（RE2/PCRE/JS Annex B）都宽容地视为 `_` 本身——上游校验器比它们
-// 全部更严（对照 V8 严格文法 u 标志，唯一同样拒绝的实现）。实案：ZCode 的 exa 插件
+// 全部更严（对照 V8 严格文法 u 标志，唯一同样拒绝的实现）。实案：某编码 agent 的 exa 插件
 // agent_run 工具 runId/previousRunId 带 `^agent\_run\_`，deepseek 系全家确定性 400
 // → 网关侧归 ErrClient 只换号不罚但喂连败计数 → 轮转烧满 5 连败触发连败降权、
 // 客户端 503（2026-09-29/30 两次实案）。schema 级拒绝换账号无用，只能在发送前修。

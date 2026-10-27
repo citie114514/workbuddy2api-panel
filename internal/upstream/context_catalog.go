@@ -7,7 +7,7 @@
 //   - model.json 本地缓存（数据目录，含运行时 models.dev 按需补值，见 model_catalog.go）；
 //   - models.dev 按需拉取（异步不阻塞；仍未知 → context_length 1M 兜底——宁可高估
 //     不低估：高估代价是客户端不截断、上游报错可重试；低估代价是下游客户端
-//     （Codex/ZCode/Claude Code 按 context_length 提前截断）白白丢上下文；
+//     （Codex/pi/Claude Code 按 context_length 提前截断）白白丢上下文；
 //     max_output_tokens 未知 → 省略字段（输出上限无合估算据，不编造））。
 //
 // 知识表**一处定义、CN/global 两域共用**：context_length 是模型固有属性——fork

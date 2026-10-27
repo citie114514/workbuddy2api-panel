@@ -434,7 +434,7 @@ func (h *Handler) modelList() []map[string]any {
 		// 上游动态值（maxInputTokens/maxOutputTokens）权威 → 静态种子表 →
 		// model.json 本地缓存 → models.dev 按需拉取（异步不阻塞本次响应，拉到后
 		// 写 model.json 供下次命中）→ 1M 兜底 / max_output_tokens 省略。
-		// 上游零值不再透出假 131072（误导 Codex/ZCode 等按 context_length 提前
+		// 上游零值不再透出假 131072（误导 Codex/pi/Claude Code 等按 context_length 提前
 		// 截断、白白丢上下文）。
 		entry["context_length"] = upstream.ContextWindowListingV4(mi.ID, mi.ContextWindow, h.cfg.Upstream.HTTP)
 		if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, h.cfg.Upstream.HTTP); ok {

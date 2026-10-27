@@ -27,7 +27,7 @@
 >
 > 因使用非官方客户端导致的账号风控 / 封禁，由使用者自行承担。
 >
-> **维护方式披露**：本 fork 的 issue / PR 处置、代码审查、测试与修复实现**主要由 AI 编码 agent（ZCode）完成**，合并与发布决策由仓库所有者 [@citie114514](https://github.com/citie114514) 作出。请知悉后再使用或参与贡献。
+> **维护方式披露**：本 fork 的 issue / PR 处置、代码审查、测试与修复实现**由多个 AI 编码 agent（以 pi、Claude Code 为主，ZCode 等为辅）完成**，合并与发布决策由仓库所有者 [@citie114514](https://github.com/citie114514) 作出。请知悉后再使用或参与贡献。
 
 > **项目沿革**：[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)（已删库）→ [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)（面板增强分支，2026-10-21 停止维护）→ **本仓库（继任维护）**。
 > 面板分支已完整吸收 Sliverkiss 删库前的最后一次更新（`ea8b1e5`），并在其基础上重构了可视化运维层；差异概览见 [与上游的差异](#-与上游的差异)，上游设计的精巧之处（账号池调度、错误分类、提示词体系）原样保留，详见下文。
