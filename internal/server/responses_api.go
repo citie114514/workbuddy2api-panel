@@ -325,7 +325,8 @@ func responsesToolOutputToChat(output any) any {
 }
 
 // responsesContentToChat message 项的 content（string 或片段数组）→ chat content。
-// 单一文本片段折叠为裸字符串（对上游最友好），多片段保持数组形态。func responsesContentToChat(content any) any {
+// 单一文本片段折叠为裸字符串（对上游最友好），多片段保持数组形态。
+func responsesContentToChat(content any) any {
 	parts, ok := content.([]any)
 	if !ok {
 		if s, ok := content.(string); ok {

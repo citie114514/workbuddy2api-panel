@@ -310,7 +310,6 @@ func anthropicResultContent(content any) any {
 	}
 	return out
 }
-}
 
 // ── 非流式响应转换 ──────────────────────────────────────────────────────
 
