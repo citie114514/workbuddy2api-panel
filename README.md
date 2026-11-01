@@ -55,11 +55,11 @@
 
 ## 项目简介
 
-WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾讯 CodeBuddy（`copilot.tencent.com`）账号包装为统一的 `/v1/chat/completions` 服务。
+WorkBuddy2API 是一个自托管的**多协议反向代理网关**，将腾讯 CodeBuddy（`copilot.tencent.com`）账号包装为 `/v1/chat/completions`、`/v1/responses`、`/v1/messages` 三类兼容端点。
 
 - 官方不提供 OpenAI 形态的开放 API，本项目通过 **OAuth 设备授权**（面板「添加账号」或 `login.sh`）获取账号凭证，在网关侧做 token 自动刷新、账号池调度与流量治理；
 - 面向 **个人多账号** 场景：多账号共享、单号故障自动换号、冷却 / 熔断防止雪崩、会话粘性保证多轮上下文不跳号；
-- 对客户端只暴露 OpenAI 兼容接口，现有 SDK / 前端 / 工具 **零改造接入**。
+- 对客户端暴露 **OpenAI 兼容 + OpenAI Responses + Anthropic Messages** 三种协议，Codex / Claude Code / pi / dsh / 昔涟等客户端**直连零改造**，不需要外层协议转换器。
 
 > ⚠️ 合规须知：本项目是**非官方**网关，使用 CodeBuddy 账号作为上游，**仅限本人授权账号、本机 / 私有环境测试**。详细边界见[安全与合规](#安全与合规)。
 
@@ -168,6 +168,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 | 能力 | 说明 |
 |---|---|
+| **原生双协议端点（v1.14.0）** | 上游只提供 `/v1/chat/completions`。本分支新增 **`/v1/responses`**（OpenAI Responses）与 **`/v1/messages`**（Anthropic Messages，含 `count_tokens`）：请求转 chat 形态喂既有管道，ResponseWriter 包装器把出站 SSE 帧 / 聚合 JSON / 错误 JSON 实时翻译回目标协议。**选号、粘性、熔断、限流治理、用量统计、工具标记修复全部零改动继承**——Codex / Claude Code 直连，无需 new-api / ccswitch 那层中转 |
 | **Web 管理面板** | `internal/panel`，前端 go:embed 单文件进二进制，零外部依赖。账号池可视化（健康色条 / 积分量条 / 冷却倒计时）、积分到期分布、单号运维、批量任务、日志查看、明暗主题 |
 | **请求指标与脱敏日志** | 面板展示完成成功率 / HTTP 成功率 / 平均耗时 / 最近请求，响应带 `X-Request-Id`；JSONL 只归档请求元数据，不写提示词、响应正文或凭证 |
 | **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
@@ -400,10 +401,30 @@ curl -sN http://localhost:7863/v1/messages \
   -d '{"model":"deepseek-v4-flash","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
-支持面：instructions / system、文本与图片、function 工具与 tool_use / tool_result
-回放、`reasoning.effort`、`max_output_tokens` / `max_tokens`、流式与非流式、
-错误按目标协议形状返回。模型名不映射——客户端需直接使用网关模型名
-（`/v1/models` 可查；Anthropic SDK 调用时网关按 `anthropic-version` 头返回 Anthropic 列表形状）。
+支持面：
+
+| 维度 | `/v1/responses`（OpenAI Responses） | `/v1/messages`（Anthropic Messages） |
+|---|---|---|
+| 输入 | `instructions` / `input`（字符串或 item 数组）、文本与图片 | `system` 块 / `text` / `image`、容忍 `messages` 里的 `role:"system"` |
+| 工具 | `function` 工具、`function_call` / `function_call_output` 回放（**数组形态的图片结果逐块分流**，不是整体字符串化） | `tools` + `tool_choice`（`any` → `required`）、`tool_use` / `tool_result` 回放（**含 base64 图片块**） |
+| 推理 | `reasoning.effort`；思维链以 `reasoning` 输出项透出（受 `reasoning.summary` 控制） | 思维链以 `thinking` 块透出（`thinking_delta` + `signature` 占位） |
+| 计量 | `output_tokens_details.reasoning_tokens`、`input_tokens_details.cached_tokens` | `usage.cache_read_input_tokens` / `cache_creation_input_tokens` |
+| 输出 | `max_output_tokens`、流式（`response.created` → `output_text.delta` → `response.completed`，含 usage）与非流式 | `max_tokens`（必填）、`stop_sequences`、流式（`message_start` → `content_block_delta` → `message_stop`）与非流式 |
+| 鉴权 | `Authorization: Bearer` | `x-api-key`（Anthropic SDK 标准）或 `Authorization: Bearer` |
+| 错误 | 非流式 `{"error":{...}}`（OpenAI 形状）；流内错误帧 → `response.failed` | 恒 Anthropic 形状 `{"type":"error","error":{...}}`（不因缺 `anthropic-version` 头而变） |
+
+模型名不映射——客户端需直接使用网关模型名（`/v1/models` 可查；Anthropic SDK
+调用时网关按 `anthropic-version` 头返回 Anthropic 列表形状，且该端点同样接受 `x-api-key`）。
+
+> 两端点的 SSE 负载均带规范 `data:` 前缀（缺前缀时 eventsource 解析器会把事件当未知字段丢弃、以空 data 派发，只有真实客户端才暴露——curl 与子串断言都测不出）。
+
+#### Anthropic 传输的额外好处：自动带上 `max_tokens`
+
+上游按 **`prompt_tokens` + 输出预留** 判上下文超限，而预留取决于请求有没有显式 `max_tokens`
+（没给时用模型默认值，实测 global 384000 / cn 128000）。走 `/v1/messages` 的客户端行为与
+Claude Code 一致——**Anthropic 协议要求 `max_tokens` 必填**，所以天然带上一个合理值，不会
+被默认预留拖累。OpenAI 兼容路径不强制该字段，缺失时见
+[常见问题](#上游报-11115prompt-is-too-long但其实没那么长)（v1.16.2 起网关会按上游报文反推并自动修复重发）。
 
 ## 配置说明
 
