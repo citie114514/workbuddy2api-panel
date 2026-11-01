@@ -649,6 +649,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// （如 global:deepseek-v4.1-flash → -sg）。回退型号再阻塞就走既有 model_blocked
 	// 错误口径，不做 "-sg-sg" 链式递归。
 	fallbackTried := false
+	// promptTooLongRepairs 11115 可修复重发的次数（见下方 ErrPromptTooLong 分支）。
+	// 最多两跳收敛：第一跳补一个明确的小预留，第二跳按反推出的 prompt 精确收敛；
+	// 仍越界说明输入本身贴顶，透传上游原文交回客户端。
+	promptTooLongRepairs := 0
 
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	// ExtractKey 与粘性开关解耦（issue #35 侧）：关闭粘性时会话头族的聚合主键仍按
@@ -1032,15 +1036,41 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeHTTPError
 				return
 			}
-			// 11115「prompt is too long」：立即透传上游原文回客户端，**不罚号不轮转**
-			// ——上下文超限是请求的问题（同一 body 换任何号都超限，白扔健康号配额；
-			// 与 WAF IP fail-fast 同哲学：确定与账号无关的错误直接终止轮转）。
+			// 11115「prompt is too long」：先尝试可修复重发，救不回来才透传原文。
+			//
+			// 上游的越界口径是 prompt_tokens + **输出预留** > 模型窗口，而预留的取值
+			// 取决于请求体有没有显式 max_tokens：没给时用模型默认值（实测 global
+			// 384000 / cn 128000）。不带 max_tokens 的 OpenAI 兼容客户端（昔涟走
+			// ai-sdk）于是凭空背上一大笔预留，明明还有几十万 token 可用也被顶成 400；
+			// 而 pi / Claude Code / dsh 都显式发 max_tokens，预留被压小，所以正常。
+			// 这里用上游报文里的 used/limit 反推真实 prompt，收窄输出上限后重发一次
+			// （最多 promptTooLongMaxRepair 跳），把「必然失败」变成「按剩余窗口如实作答」。
+			//
+			// 收窄的语义边界：只放宽/收紧**输出上限**，不改任何输入内容；拿到的
+			// budget 是窗口如实剩余的空间。收窄后仍然 11115，说明输入本身贴顶，
+			// 那时才把上游原文透传给客户端（换任何号、任何 max_tokens 都一样）。
 			// applyErrorPolicy ErrPromptTooLong 分支零动作，fail 只释放租约。
-			// message 装上游 body 原文（含真实 token 数与上限值——上游原文是最有价值
-			// 的错误信息，客户端必须看到，禁止固定词覆盖）。
 			if kind == upstream.ErrPromptTooLong {
 				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 				fail(acct.UID)
+				budget, repaired := h.planPromptTooLongRepair(string(respBody), body, promptTooLongRepairs)
+				if repaired {
+					body = upstream.WithMaxTokens(body, budget)
+					promptTooLongRepairs++
+					delete(tried, acct.UID) // 重发不该让健康号进 tried 后被排除
+					log.Printf("INFO: [server] prompt_too_long repair #%d model=%s -> max_tokens=%d (%s)",
+						promptTooLongRepairs, bareModel, budget, upstream.PromptTooLongSummaryOf(string(respBody)))
+					if !rotateBackoff(i, r.Context()) {
+						break
+					}
+					// 重发不是「换号轮转」，不该吃掉 MaxRotate 预算——否则把轮转
+					// 上限配成 1 的部署就永远修不了（它连第二次机会都没有）。
+					// 次数由 promptTooLongRepairs 封顶，循环必然收敛。
+					i--
+					continue
+				}
+				// message 装上游 body 原文（含真实 token 数与上限值——上游原文是最有价值
+				// 的错误信息，客户端必须看到，禁止固定词覆盖）。
 				writeOpenAIErrorHint(w, http.StatusBadRequest, "prompt_too_long", promptTooLongMessage(string(respBody)),
 					h.hintOf(upstream.ErrPromptTooLong, string(respBody), bareModel, reqHasImage, uerr))
 				st.status = http.StatusBadRequest
@@ -1404,6 +1434,26 @@ func promptTooLongMessage(body string) string {
 		return "prompt is too long"
 	}
 	return body
+}
+
+// promptTooLongMaxRepair 单个请求允许的 11115 可修复重发次数。两跳足够收敛
+// （第一跳补明确的小预留、第二跳按反推的 prompt 精确算预算），再撞就越界来自
+// 输入本身，透传原文比继续重试更有用。
+const promptTooLongMaxRepair = 2
+
+// planPromptTooLongRepair 决定这一次 11115 是否值得重发，以及重发用的 max_tokens。
+// 判定逻辑与收敛性说明见 upstream.PlanPromptTooLongRepair；这里只负责把请求侧
+// 事实（已重发次数、body 里的显式 max_tokens）喂进去。
+func (h *Handler) planPromptTooLongRepair(respBody string, body []byte, repairs int) (int64, bool) {
+	if repairs >= promptTooLongMaxRepair {
+		return 0, false
+	}
+	used, limit, ok := upstream.ParsePromptTooLong(respBody)
+	if !ok {
+		return 0, false
+	}
+	sent, explicit := upstream.MaxTokensInBody(body)
+	return upstream.PlanPromptTooLongRepair(used, limit, sent, explicit)
 }
 
 // usageCreditTotal 从聚合响应取 usage.credit 与 total_tokens（成本台账非流式入口）。

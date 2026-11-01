@@ -553,6 +553,7 @@ WARN: [server] stream ...: saw M native tool call block(s) but repaired none (to
 | 上游 404 | HTTP 404 | 软冷却固定 60s（不随 `soft_rate`、不单独退避） | 到期自动恢复 |
 | 服务端错误 | HTTP ≥500 | 喂连续失败计数，达阈值熔断 | 熔断到期 / 成功清零 |
 | 请求体解析失败 | HTTP 400 + `Unmarshal chat params failed` / code `11101` | **不罚账号，但仍轮转**（客户端畸形 JSON，换号照样 400） | 即时 |
+| 上下文超限 | HTTP 400 + code `11115`「prompt is too long」 | **不罚账号**；先收窄输出上限自动重发（最多 2 次），救不回来才透传上游原文（见[常见问题](#上游报-11115prompt-is-too-long但其实没那么长)） | 即时 |
 | 内容拦截 | HTTP 400 + 审核文案 | **不罚账号**，`passthrough` 模式走降级重试 | 即时 |
 | 客户端错误 | 其余 4xx / 业务 `code≠0` | 不处罚，换号重试 | 即时 |
 
@@ -1014,6 +1015,24 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 - 多图/长上下文会话（历史图片每轮以 base64 重发，编码再膨胀约 37%）不会再撞网关侧 413
 - 若上游真的返回 413/超限错误，网关按既有错误分类链路如实透传（不打码、不罚号——超限是请求侧问题）
 - 客户端中途断流导致的半截 body 在读入阶段即报 `400 invalid_request`，不会把截断 JSON 喂给上游（issue #41 语义保留在读错误路径）
+
+### 上游报 11115「prompt is too long」但其实没那么长？
+
+上游的越界判据是 **`prompt_tokens` + 输出预留 > 模型窗口**，不是只看输入。输出预留的取值：
+
+- 请求体带了 `max_tokens`（且不超过模型上限）→ 预留就等于该值；
+- 没带（或带了个会被上游静默换掉的大值）→ 预留取模型默认值。实测 `global:deepseek-v4.1-flash` 默认 **384000**、`cn:deepseek-v4.1-flash` 默认 **128000**。
+
+所以同一份 ~870k token 的会话：pi / Claude Code / dsh 都显式发 `max_tokens`，预留被压到几万，正常通过；而只发 OpenAI 兼容体、不带 `max_tokens` 的客户端（如昔涟 Cyrene 走 ai-sdk 路径）会凭空背上 384k 预留，被硬顶成 `prompt is too long: 868040 tokens > 1048576 maximum`。
+
+网关的处理（v1.16.2 起）：
+
+1. 收到 11115 时解析报文里的 `used`（= prompt + 预留）与 `limit`，**不猜、不估算**；
+2. 客户端显式声明了 ≤32768 的输出上限 → 直接反推 `prompt = used - max_tokens`，一次算出「窗口还装得下多少」并重发；否则先补一个明确的 32768 预留重发，下一跳再精确收敛；
+3. 最多重发 2 次且不吃 `MaxRotate` 预算；重发不改任何输入内容，只收窄输出上限，也不罚号；
+4. 收窄后仍越界 = 输入本身贴顶，**原样透传上游原文**（含真实 token 数与窗口上限），客户端据此压缩上下文或换更大窗口的模型。
+
+排查时看网关日志里的 `prompt_too_long repair #N ... -> max_tokens=...`，能直接看到反推出的预算。若你在客户端能配 `max_tokens`，配一个合适的值（如 32768）就不会触发这条路径。
 
 ### Docker 部署登录后报「写入 auths/…json.tmp 失败： permission denied」？
 
