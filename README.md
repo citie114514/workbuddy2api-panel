@@ -1121,8 +1121,11 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 
 本项目采用 [MIT License](LICENSE) 开源协议。
 
+Copyright (c) 2026 Sliverkiss（上游原作）、linguo2625469（面板分支）、**citie114514（继任维护，本仓库）**。
+
 - 允许任意使用、复制、修改、合并、发布、分发、再授权及销售
-- 再分发（源码或二进制形式）时，请保留原仓库的 MIT 版权声明与许可声明（如在 NOTICE 或 README 中注明原始出处 `https://github.com/Sliverkiss/workbuddy2api`）
+- 再分发（源码或二进制形式）时，请**保留 LICENSE 中的全部三行版权声明**与许可声明——MIT 要求保留前手的署名，不只是本仓库的
+- 原始出处：`https://github.com/Sliverkiss/workbuddy2api`（上游，已删库）
 - 本项目不授予任何上游（CodeBuddy / 腾讯）接口或服务的权利；使用者仍需自行遵守上游服务条款
 
 ### 按地区配置账号池调度
