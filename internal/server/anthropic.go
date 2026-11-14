@@ -35,9 +35,9 @@ func (h *Handler) withAnthropicAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (h *Handler) anthropicMessages(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "read body: "+err.Error())
+	body, berr := h.readBody(w, r)
+	if berr != nil {
+		h.writeBodyError(w, berr, true)
 		return
 	}
 	chat, srv, err := messagesToChat(body)

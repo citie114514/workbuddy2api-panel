@@ -6,7 +6,8 @@
   "timeout_rotate_extra": 1,
   "dns_servers": [],
   "server": {
-    "read_timeout": "300s"
+    "read_timeout": "300s",
+    "max_payload_bytes": 67108864
   },
   "panel": {
     "package_detail_limit": 5

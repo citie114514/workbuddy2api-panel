@@ -49,6 +49,9 @@ type Config struct {
 	// 上游把「账号存在异常行为」判在设备与出口上，不是判在单个账号上：一个请求
 	// 顺着轮转能把池子挨个撞一遍（社区复盘：一次任务 7 个号全封）。
 	RestrictionHold time.Duration
+	// MaxPayloadBytes 入站请求体安全上限（0 = 用内置 64MiB）。护栏不是内容策略：
+	// 远高于真实会话（长会话多图 base64 实测几 MB），只挡能把进程读死的上传。
+	MaxPayloadBytes int64
 
 	// Panel 管理面板 handler（可选；nil = 不挂载）。挂载在 /panel/ 前缀下，
 	// 面板自带 Bearer 鉴权（同一 api_key）与内嵌静态资源，主路由只做转发。
@@ -625,9 +628,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 上游自然返回错误（其响应经既有错误分类链路透出，信息量更大）。#41 的截断
 	// 防御语义保留在读错误路径——移除预拦截后，截断只可能来自客户端自己断流，
 	// 读 body 出错就地 400，不把半截 JSON 喂上游 unmarshal 报 unexpected EOF 冤枉罚号。
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+	body, berr := h.readBody(w, r)
+	if berr != nil {
+		h.writeBodyError(w, berr, false)
 		return
 	}
 	var peek struct {

@@ -61,6 +61,13 @@ type Config struct {
 		// 在途 SSE 的合法时长可达分钟级，旧的固定 5s 必然把在途流掐成连接重置；
 		// "0" = 立即退出（不等在途），负值 fail fast。改动需重启进程。
 		ShutdownTimeout string `json:"shutdown_timeout,omitempty"` // "30s"
+		// MaxPayloadBytes 入站请求体安全上限（字节），缺省 67108864（64MiB），
+		// 允许范围 8MiB–512MiB。**护栏不是内容策略**：真实会话（长会话多图
+		// base64）实测在几 MB 量级，这里只挡能把进程读死的上传——io.ReadAll
+		// 无界时一次几百 MB 的 body 就能在小内存机器上把网关连同伴生面板一起 OOM。
+		// 超限回 413 payload_too_large（先排空有限字节再回，避免客户端只看到
+		// connection reset 看不到 413）。改动需重启进程。
+		MaxPayloadBytes int64 `json:"max_payload_bytes"`
 	} `json:"server"`
 
 	Cooldown struct {
@@ -341,6 +348,8 @@ func Default() *Config {
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
 	c.Server.ShutdownTimeout = "30s"
+	// 入站请求体安全上限默认 64MiB（护栏，不是内容策略）；0 = 用内置默认。
+	c.Server.MaxPayloadBytes = 64 << 20
 	c.Panel.PackageDetailLimit = 5
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
@@ -619,6 +628,20 @@ func (c *Config) normalize() error {
 	}
 	if c.ServerReadTimeoutDur < 0 {
 		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
+	}
+	// 入站请求体安全上限：0/缺省回落 64MiB；负值 fail fast；低于 8MiB 会误伤
+	// 真实会话（长会话多图 base64 实测几 MB），高于 512MiB 就不再是护栏而是策略。
+	if c.Server.MaxPayloadBytes == 0 {
+		c.Server.MaxPayloadBytes = 64 << 20
+	}
+	if c.Server.MaxPayloadBytes < 0 {
+		return fmt.Errorf("server.max_payload_bytes: 负值 %d 无意义", c.Server.MaxPayloadBytes)
+	}
+	if c.Server.MaxPayloadBytes < 8<<20 {
+		return fmt.Errorf("server.max_payload_bytes: %d 低于 8MiB，会误伤真实会话（长会话多图 base64 实测在几 MB 量级）", c.Server.MaxPayloadBytes)
+	}
+	if c.Server.MaxPayloadBytes > 512<<20 {
+		return fmt.Errorf("server.max_payload_bytes: %d 超过 512MiB，已超出护栏范畴", c.Server.MaxPayloadBytes)
 	}
 	// 优雅关停窗口：空值回落 30s；"0" = 立即退出；负值 fail fast。
 	// 旧实现硬编码 5s，在途 SSE 合法时长可达分钟级，必然被掐成连接重置。

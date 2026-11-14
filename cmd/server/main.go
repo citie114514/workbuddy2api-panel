@@ -365,6 +365,7 @@ func main() {
 		RedisMode:          redisMode,
 		SoftCooldown:       cfg.SoftRateDur,
 		RestrictionHold:    time.Duration(cfg.Upstream.RestrictionHoldSeconds) * time.Second,
+		MaxPayloadBytes:    cfg.Server.MaxPayloadBytes,
 		TimeoutRotateExtra: cfg.TimeoutRotateExtra,
 		Panel:              pn,
 		Live:               live,
