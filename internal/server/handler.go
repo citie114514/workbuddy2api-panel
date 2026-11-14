@@ -45,6 +45,10 @@ type Config struct {
 	RedisMode    string
 	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+	// RestrictionHold 11140 风控连坐的全池暂停时长（0 = 只保留「命中即停手」那道闸）。
+	// 上游把「账号存在异常行为」判在设备与出口上，不是判在单个账号上：一个请求
+	// 顺着轮转能把池子挨个撞一遍（社区复盘：一次任务 7 个号全封）。
+	RestrictionHold time.Duration
 
 	// Panel 管理面板 handler（可选；nil = 不挂载）。挂载在 /panel/ 前缀下，
 	// 面板自带 Bearer 鉴权（同一 api_key）与内嵌静态资源，主路由只做转发。
@@ -134,6 +138,9 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// restrict 11140 风控连坐保护（restrict.go）：同一窗口内多个账号被限制
+	// 就全池暂停派发。状态在进程内、重启清零——「暂停」是「现在先别打」。
+	restrict restrictionGate
 }
 
 // NewHandler 构建 handler。
@@ -660,6 +667,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer st.done()
 
+	// 11140 风控连坐暂停（见 restrict.go）：同一窗口里已经有两个不同账号被上游判
+	// 「存在异常行为」，说明拦的是设备/出口而不是某个号。此期间**不派发**——快速失败，
+	// 不拿池子剩下的健康号去试，否则只会把封禁面继续扩大。
+	if d := h.restrict.remaining(); d > 0 {
+		secs := int(d.Round(time.Second) / time.Second)
+		// Retry-After 让客户端知道等多久，而不是自己一秒重试一次继续撞风控。
+		w.Header().Set("Retry-After", retryAfterHeader(d))
+		msg := fmt.Sprintf("upstream restricted several accounts for unusual activity (403 / code 11140); dispatch paused for %ds to avoid further bans — do not rotate accounts or retry in a loop", secs)
+		downgraded := writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "account_restricted_hold", msg,
+			"wait for the restriction hold to expire or appeal to WorkBuddy; rotating accounts during a restriction wave gets more of them banned")
+		st.status = http.StatusServiceUnavailable
+		st.outcome = reqlog.OutcomeHTTPError
+		recordErrorOutcome(st, http.StatusServiceUnavailable, downgraded)
+		return
+	}
+
 	// models.hidden 黑名单：点名调用直接拒绝，不打上游、不占选号。
 	// 与 /v1/models 的列表过滤对称（只藏列表不够，知道名字仍可硬调）。
 	if _, hide := h.loadLive().HiddenModels[realm+":"+bareModel]; hide {
@@ -1144,6 +1167,39 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			} else {
 				kind = upstream.Classify(status, string(respBody))
 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+			}
+			// 11140 风控限制文书（设备/出口级）：换号会连坐，必须就地停手。
+			//
+			// 11140 有两种形态，处置方向相反：英文 "request illegal" 是渠道校验/授权
+			// （账号级，见 IsAccountRestricted，判在该号上）；中文「账号存在异常行为，
+			// 已被限制使用」/ "unusual activity" 是风控限制文书——上游判的是设备与
+			// 出口，换任何号都会撞同一堵墙（社区复盘：一次任务 7 个号全封）。
+			// 因此这里**不轮转**：停掉该号 → 终止本轮 → 让调用方等，而不是拿池子里
+			// 剩下的健康号去试。同一窗口内出现第二个不同账号被限 → 全池暂停派发。
+			if upstream.IsRiskRestricted(string(respBody)) {
+				h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+				h.cfg.Pool.Disable(acct.UID, "account restricted by upstream risk control (11140 账号存在异常行为); appeal in WorkBuddy (submit feedback)")
+				failKeepBinding()
+				waved := h.restrict.note(acct.UID, h.cfg.RestrictionHold)
+				if n := h.cfg.Alert; n != nil && waved {
+					n.Report("account_restriction_wave",
+						"风控信号：多个账号被上游判「存在异常行为」，已全池暂停派发（轮转已止损）",
+						"连坐判据在设备与出口上；此窗口内继续换号只会扩大封禁面。")
+				}
+				msg := "upstream restricted this account for unusual activity (code 11140); not rotating — rotating accounts during a restriction wave gets more of them banned"
+				if waved {
+					msg = "upstream restricted several accounts for unusual activity (code 11140); dispatch paused pool-wide to avoid further bans — do not retry in a loop"
+				}
+				if s := strings.TrimSpace(string(respBody)); s != "" {
+					msg = s // 上游原文优先：含 requestId，用户要拿去申诉
+				}
+				hint := "appeal to WorkBuddy (submit feedback) to lift the restriction; rotating accounts or retrying in a loop will get more accounts banned"
+				if d := h.restrict.remaining(); d > 0 {
+					hint += "; pool dispatch paused for another " + d.Round(time.Second).String()
+				}
+				downgraded := writeOpenAIErrorHint(w, http.StatusServiceUnavailable, "account_restricted", msg, hint)
+				recordErrorOutcome(st, http.StatusServiceUnavailable, downgraded)
+				return
 			}
 			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append

@@ -736,6 +736,14 @@ func Classify(status int, body string) ErrKind {
 	if IsAccountRestricted(body) {
 		return ErrAccountFault
 	}
+	// 11140 风控限制文书（中文「账号存在异常行为，已被限制使用」/ "unusual activity"）：
+	// 与上面的 "request illegal" 同属账号被上游限制，只是文案不同。不在这里认下来，
+	// 它会落到下方 status==429/4xx 兜底变成 ErrSoftRate——handler 于是把它当成「等几分钟
+	// 就好」的限流，继续换号重试，而这一类判据在上游是**设备/出口级**（换号只会连坐）。
+	// 判据要求 code 11140 + 限制文案双条件，故不会吃掉同 code 的模型限流变体。
+	if IsRiskRestricted(body) {
+		return ErrAccountFault
+	}
 	for _, m := range accountFaultMarkers {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
 			return ErrAccountFault

@@ -166,6 +166,11 @@ type Config struct {
 		HeaderTimeoutSeconds int `json:"header_timeout_seconds"`
 		// IdleTimeoutSeconds 聊天 SSE 流中空闲上限（活跃吐数据续命不掐）；<=0 回落默认 300。
 		IdleTimeoutSeconds int `json:"idle_timeout_seconds"`
+		// RestrictionHoldSeconds 11140 风控连坐的全池暂停时长（秒），默认 1800；
+		// 0 = 只保留「命中即停手」那道闸（不暂停全池）。见 internal/server/restrict.go。
+		// 上游把「账号存在异常行为」判在设备与出口上：一个请求顺着轮转能把池子
+		// 挨个撞一遍，暂停的意义是「现在先别打」，窗口过后自动解除。
+		RestrictionHoldSeconds int `json:"restriction_hold_seconds"`
 		// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 		// 全部出站请求生效：chat/refresh/checkin/balance/report/travel/FetchModels。
 		// 默认值已对齐官方 WorkBuddy 桌面形态（三段式），用户仍可配完全自定义值改写。
@@ -373,6 +378,8 @@ func Default() *Config {
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
+	// 11140 风控连坐全池暂停默认 30 分钟（0 = 只保留「命中即停手」）。
+	c.Upstream.RestrictionHoldSeconds = 1800
 	// Global.Enabled 缺省 true（纯 CN 行为不变：CN 账号恒判 cn，global base 不被使用）；
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
