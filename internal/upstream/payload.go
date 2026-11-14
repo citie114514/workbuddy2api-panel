@@ -108,6 +108,11 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	modelName, _ := obj["model"].(string)
 	injectThinking(obj, lookupDefaultEffort(defaultEfforts, modelName))
 	normalizeReasoningEffort(obj, efforts)
+	// 输出预算下限（见 output_budget.go）：必须排在 injectThinking + normalizeReasoningEffort
+	// 之后——读的是降级/补档后的**真实**档位，与上游实际执行的档位一致。思考与正文在
+	// 同一份额度里结算，客户端拍的 max_tokens 过小时思考先吃掉一半、正文断在句子中间。
+	// modelCap 传 0（未知）= 以本表下限为准；目录能力查询在 handler 层，不在这里重复拉取。
+	ensureMinOutputBudget(obj, effectiveEffort(obj), 0)
 	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
 	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
 	backfillReasoningContent(obj)
