@@ -192,7 +192,11 @@ func TestPromptTooLongRepairKeepsAccountHealthy(t *testing.T) {
 }
 
 // TestPromptTooLongKeepsExplicitSmallMaxTokens 客户端自己给了正常大小的 max_tokens
-// 且不越界时，网关绝不动它的值（修复只发生在已经 400 的路径上）。
+// 且不越界时，11115 修复路径绝不动它的值（修复只发生在已经 400 的路径上）。
+//
+// 注意取值必须**高于输出预算下限**：output_budget.go 会对「低于该档下限」的显式额度
+// 抬到下限（deepseek 默认 effort=high → 8192），那是另一条独立且有意为之的改写，
+// 与本测试要钉的「11115 修复不误伤正常请求」无关。用 20000 把两者隔离开。
 func TestPromptTooLongKeepsExplicitSmallMaxTokens(t *testing.T) {
 	f := &fakeContextUpstream{limit: 1048576, defaultReserve: 384000, promptTokens: 1000}
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
@@ -200,11 +204,11 @@ func TestPromptTooLongKeepsExplicitSmallMaxTokens(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"cn:deepseek-v4.1-flash","stream":true,"max_tokens":4096,"messages":[{"role":"user","content":"hi"}]}`)))
+		strings.NewReader(`{"model":"cn:deepseek-v4.1-flash","stream":true,"max_tokens":20000,"messages":[{"role":"user","content":"hi"}]}`)))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	if len(f.sent) != 1 || f.sent[0] != 4096 {
-		t.Fatalf("正常请求的 max_tokens 不应被改写：%v", f.sent)
+	if len(f.sent) != 1 || f.sent[0] != 20000 {
+		t.Fatalf("正常请求的 max_tokens 不应被 11115 修复改写：%v", f.sent)
 	}
 }
