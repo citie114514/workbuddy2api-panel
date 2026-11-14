@@ -116,6 +116,11 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	// DeepSeek 多轮一致性：assistant 消息带 reasoning 痕迹时回填 reasoning_content
 	// （requiresReasoningContentOnAssistantMessages，见 thinking.go）。
 	backfillReasoningContent(obj)
+	// 非 deepseek 家族的 reasoning 镜像（见 reasoning_mirror.go）：kimi/glm/minimax/
+	// mimo/step/space-bunny 的上游按 `reasoning` 读历史思考段，只认 reasoning_content
+	// 的客户端在它们那里等于「assistant 没有思考」，多轮一致性校验会挂。与上面那份的
+	// 区别是纪律相反：只镜像已有的非空值，绝不新建字段、绝不填占位。
+	mirrorUpstreamReasoning(obj)
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs)
