@@ -97,6 +97,11 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		// 「裸空消息」，正是上游 11151 的触发面（tool_pairing_test.go 的
 		// 「空name带结果」用例就是这条路径）。
 		msgs, _ = repairEmptyContent(msgs)
+		// 空 text 段补位（见 empty_text_part.go）：上游对每个 text 段做长度校验，
+		// `text` 为空串/缺失/为 null 时整条消息判 11151。与上面的 repairEmptyContent
+		// 互补：那条管「整条 content 为空」，这条管「parts 数组里某个 text 段为空」，
+		// 且额外覆盖「字符串信封被上游嗅探成 parts」这一形态。
+		guardEmptyTextParts(msgs)
 		// 无改动时两步都返回原 slice，这里回写等于零操作；任一步重排/删除
 		// （哪怕后续步骤零改动）也必须落到 obj——不能只在「最后一步改动」时回写，
 		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
