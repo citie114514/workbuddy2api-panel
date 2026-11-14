@@ -734,6 +734,8 @@ type anthState struct {
 	tools                 map[int]*anthTool
 	toolOrder             []int
 	usage                 map[string]any
+	fed                   bool // 已出过内容（thinking 或 text）
+	full                  bool // 已收过整条 message，后续 delta 不再重复拼
 }
 
 type anthTool struct {
@@ -896,50 +898,42 @@ func (w *messagesWriter) handleChunk(obj map[string]any) error {
 	if c == nil {
 		return nil
 	}
-	if d, _ := c["delta"].(map[string]any); d != nil {
+	// 一帧里的内容字段：delta（流式分片）与 message（上游整条下发）同构。
+	// 此前只认 delta，message 整帧被丢——上游一旦用非 delta 形态，正文与思考
+	// 会一起消失（issue #194）。
+	emitFields := func(d map[string]any) error {
 		// 上游 reasoning_content → thinking 块（Claude Code 会展示）。无 signature：
 		// 客户端回传时被 blocksToMessages 丢掉，不会触发校验。
 		if rc, ok := d["reasoning_content"].(string); ok && rc != "" {
-			if err := w.ensureThinking(); err != nil {
-				return err
-			}
-			if err := w.emit("content_block_delta", map[string]any{
-				"index": w.x.thinkIdx,
-				"delta": map[string]any{"type": "thinking_delta", "thinking": rc},
-			}); err != nil {
+			if err := w.emitThinking(rc); err != nil {
 				return err
 			}
 		}
 		if s, ok := d["content"].(string); ok && s != "" {
 			// 内联思考标签拆分（issue #194）：上游 parser 偶发把 CoT 当 content 下发，
-			// 正文首尾带 <think:SUF>/</think:SUF>。按 thinking / text 两路发出去，
-			// 而不是让 Anthropic 客户端把控制 token 当正文显示。
-			think, text := w.thinkTag.Feed(s)
-			if think != "" {
-				if err := w.ensureThinking(); err != nil {
-					return err
-				}
-				if err := w.emit("content_block_delta", map[string]any{
-					"index": w.x.thinkIdx,
-					"delta": map[string]any{"type": "thinking_delta", "thinking": think},
-				}); err != nil {
-					return err
-				}
+			// 正文首尾带 <think:SUF>/</think:SUF>。拆开后控制 token 不进 text_delta。
+			think, body := w.thinkTag.Feed(s)
+			if err := w.emitThinking(think); err != nil {
+				return err
 			}
-			if text != "" {
-				if err := w.ensureText(); err != nil {
-					return err
-				}
-				if err := w.emit("content_block_delta", map[string]any{
-					"index": w.x.textIdx,
-					"delta": map[string]any{"type": "text_delta", "text": text},
-				}); err != nil {
-					return err
-				}
+			if err := w.emitText(body); err != nil {
+				return err
 			}
 		}
-		if tcs, ok := d["tool_calls"].([]any); ok {
-			if err := w.onTools(tcs); err != nil {
+		if tcs, ok := d["tool_calls"].([]any); ok && len(tcs) > 0 {
+			return w.onTools(tcs)
+		}
+		return nil
+	}
+	// message 是整条下发，优先认；认过之后同请求的 delta 不再重复拼。
+	if msg, ok := c["message"].(map[string]any); ok && !w.x.fed {
+		w.x.full = true
+		if err := emitFields(msg); err != nil {
+			return err
+		}
+	} else if !w.x.full {
+		if d, _ := c["delta"].(map[string]any); d != nil {
+			if err := emitFields(d); err != nil {
 				return err
 			}
 		}
@@ -1035,6 +1029,36 @@ func (w *messagesWriter) ensureText() error {
 	return w.emit("content_block_start", map[string]any{
 		"index":         w.x.textIdx,
 		"content_block": map[string]any{"type": "text", "text": ""},
+	})
+}
+
+// emitThinking 发一个 thinking_delta（空串直接忽略，不占块）。
+func (w *messagesWriter) emitThinking(s string) error {
+	if s == "" {
+		return nil
+	}
+	if err := w.ensureThinking(); err != nil {
+		return err
+	}
+	w.x.fed = true
+	return w.emit("content_block_delta", map[string]any{
+		"index": w.x.thinkIdx,
+		"delta": map[string]any{"type": "thinking_delta", "thinking": s},
+	})
+}
+
+// emitText 发一个 text_delta（空串直接忽略，不占块）。
+func (w *messagesWriter) emitText(s string) error {
+	if s == "" {
+		return nil
+	}
+	if err := w.ensureText(); err != nil {
+		return err
+	}
+	w.x.fed = true
+	return w.emit("content_block_delta", map[string]any{
+		"index": w.x.textIdx,
+		"delta": map[string]any{"type": "text_delta", "text": s},
 	})
 }
 
