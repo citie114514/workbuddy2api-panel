@@ -185,6 +185,31 @@ WorkBuddy2API 是一个自托管的**多协议反向代理网关**，将腾讯 C
 | **领养前置修复** | 上游 `travelAdopt` 缺 report 前置导致领养恒失败于 `first_buddy task not completed yet`；本分支修正后实测 +300 到账（3/3 账号） |
 | **原生工具调用标记还原** | 上游（DeepSeek 系）的工具调用原生语法是带全角竖线的标记文本，**仅在请求声明了 `tools` 时**才被上游解析成结构化 `tool_calls`。实测 `tools` 声明在中转环节（Responses → chat/completions 等）丢失是常态，此时模型仍想调工具，标记就以纯文本落进 `content`——Codex 这类只执行结构化 `function_call` 的客户端会把它当普通正文写进会话历史，回合直接结束、工具一次都没跑。网关在出站响应里识别并还原成 `tool_calls`（流式与非流式都覆盖） |
 
+### 相对 zx-yk `integrated`（当前代码基线）的增量
+
+自 v1.17.0 起本仓库的代码基线是 [zx-yk/workbuddy2api-panel](https://github.com/zx-yk/workbuddy2api-panel) 的 `integrated` 分支。下表是**本仓库在该基线之上多做的东西**——全部可用 `git diff zxyk/integrated..v1.17.0` 复核，不是 README 自述。
+
+| 能力 | 解决什么 | 我们 | zx-yk | jin66 | misaka | 源码 / 测试 |
+|---|---|:--:|:--:|:--:|:--:|---|
+| **11115 可修复重发** | 不带 `max_tokens` 的客户端被上游默认输出预留（global 384k / cn 128k）顶成 `400 prompt is too long`，明明还有几十万 token 可用 | **独有** | — | — | — | 174 / 263 |
+| 输出预算下限 | `effort=high` + `max_tokens=2048` 时思考先吃掉一半额度，正文断在句子中间 | ✓ | — | ✓ | ✓ | 151 / 151 |
+| 非 deepseek 家族 reasoning 镜像 | kimi/glm/minimax/mimo/step/space-bunny 的上游按 `reasoning` 读历史思考段，只发 `reasoning_content` 等于「assistant 没有思考」 | ✓ | — | ✓ | ✓ | 90 / 129 |
+| CN Kimi 工具 `$ref` 展开 | Kimi 不接受 `parameters` 里的本地 `$ref` / `#/$defs`，MCP 客户端生成的 schema 大量使用它 | ✓ | — | ✓ | ✓ | 116 / 89 |
+| 内联思考标签 `<think:SUF>` 摘除 | 上游 reasoning parser 偶发把整段 CoT 当 content 下发，chat 客户端看到正文混着 CoT，Anthropic 客户端把它当文本 | ✓ | — | — | ✓ | 144 / 49 |
+| 11140 风控连坐保护 | 上游把「账号存在异常行为」判在设备/出口上，原处置「禁用这个号、换下一个」会让一个请求把池子撞一遍 | ✓ | — | — | ✓ | 125 / 185 |
+| 入站请求体护栏 | `io.ReadAll` 无界，一次几百 MB 上传能把小内存机器连同伴生面板一起 OOM | ✓ | — | — | ✓ | 103 / 109 |
+| 空 text 段补位 | `text` 为空串/null/缺失判 11151；含「字符串 content 被上游嗅探成 parts」这条隐蔽形态 | ✓ | — | ✓ | ✓ | 158 / 118 |
+| 6004 免费额度 → 付费兄弟回退 | 免费额度型模型额度用尽后官方客户端会切付费兄弟型号（`-sg`），网关不对齐就整池失败 | ✓ | — | — | ✓ | 见 `pool.ModelFallbackTarget` |
+| 上游「整条 message」帧 | `choices[0].message` 而非 `.delta` 时整帧被丢，正文与思考一起消失 | ✓ | — | — | ✓ | 见 `anthropic.go` |
+
+**两点需要说明的取舍**（与 misaka 同类实现的差异，不是谁抄谁）：
+
+1. **`model_fallback` 只在配额类阻塞触发**（`ModelBlockStatus.QuotaOnly`，即 6004/6000/6008）。misaka 是任何 6004 都触发；14003 容量短窗口等一会儿就自愈，此时切付费型号是白花钱。
+2. **请求体护栏是 64MiB 的进程存活护栏，不是内容策略**。旧的 8MB `max_body_mb` 因误伤多图会话被移除过，这里刻意远高于真实会话量级（长会话多图实测几 MB），只挡能把进程读死的上传。
+
+> 各项的实现细节、实测依据与「为什么这样做」都写在对应源码的文件头注释里；每个能力都带测试，测试行数普遍 ≥ 源码行数。
+
+
 ### 同步上游
 
 **第一轮（fork 基线 `53ee3a1` → `9a87758`，34 个提交）**：四类任务独立排程、pool 文件拆分、12153 连续计数才禁用、429 `code=6004` 模型级限流收窄、11101 不罚号、请求体 413、DeepSeek 思维链、reasoning_content 回填、Codex 指纹脱敏、系统提示词体系、出站 UA 可配等。
