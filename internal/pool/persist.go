@@ -6,10 +6,11 @@ import (
 	"encoding/json"
 	"log"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/safefile"
 )
 
 var flushInterval = 5 * time.Second
@@ -118,13 +119,19 @@ func (p *Pool) Flush() {
 
 // Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
 func (p *Pool) load() {
-	raw, err := os.ReadFile(p.stateFp)
+	// 掉电安全：主文件缺失/为空/非法 JSON 时回退 .bak。零长度文件是最常见的
+	// 损坏形态（rename 日志先提交、数据块后刷盘），把它当合法状态就会把真实的
+	// 冷却/成本/用量状态抹掉。
+	raw, usedBak, err := safefile.ReadWithBackup(p.stateFp, safefile.JSONValidator())
 	if err != nil {
 		return
 	}
 	var sf stateFile
 	if json.Unmarshal(raw, &sf) != nil {
 		return
+	}
+	if usedBak {
+		log.Printf("WARN: pool: state.json 不可用，已回退备份 state.json.bak")
 	}
 	p.applyAccountsLocked(sf.Accounts)
 	p.restoreSchedulingLocked(sf.Scheduling)
@@ -161,6 +168,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			tokenUsage:               s.TokenUsage,
 			softStreak:               s.SoftStreak,
 			sessionDeadFails:         s.SessionDeadFails,
+			disabledAt:               s.DisabledAt,
 			consecutiveFails:         s.ConsecutiveFails,
 		}
 		// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复。
@@ -200,23 +208,44 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				if mc.Until.IsZero() || !now.Before(mc.Until) {
 					continue
 				}
+				// 存量钳制：11102/11158 是退避式负缓存，旧版本写的是 6h 基数 / 24h 上限。
+				// 常量收窄后如果不动存量，升级要等这些条目自然到期才生效（最长 24 小时）。
+				// 6004 是上游重置墙钟语义，绝不碰。
+				if modelBlockReason(mc.Reason) {
+					if cap := now.Add(modelBlockMaxTTLFor(mc.Reason)); mc.Until.After(cap) {
+						mc.Until = cap
+					}
+				}
 				if e.modelCooldowns == nil {
 					e.modelCooldowns = map[string]modelCooldown{}
 				}
-				e.modelCooldowns[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
+				e.modelCooldowns[m] = modelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly, Capacity: mc.Capacity}
 			}
 		}
 		// 成本账本：惰性过滤过期（modelCostTTL 外不恢复）+ 剔除结构破损条目
 		// （负 per1k / 零 LastSeen——上游异常或旧文件手改产生的脏数据）。
+		//
+		// 另做一次性口径迁移：无 last_per_1k 的条目**不恢复**。这些条目来自
+		// 「用 EMA 判层」的旧口径，其中既有"付过一次费就永久收费"的单向污染，
+		// 也有历史 -sg 兄弟模型扣费记错账留下的不可信值。保留它们会让单号垄断
+		// 在升级后继续存在；丢弃后退回「无观测」层，由下一次真实请求重新学习。
 		if len(s.ModelCosts) > 0 {
+			dropped := 0
 			for m, mc := range s.ModelCosts {
 				if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL || mc.CostPer1k < 0 {
+					continue
+				}
+				if mc.LastPer1k == nil {
+					dropped++
 					continue
 				}
 				if e.modelCost == nil {
 					e.modelCost = map[string]modelCostEntry{}
 				}
-				e.modelCost[m] = modelCostEntry{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
+				e.modelCost[m] = modelCostEntry{CostPer1k: mc.CostPer1k, LastPer1k: mc.LastPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
+			}
+			if dropped > 0 {
+				log.Printf("[pool] cost ledger: dropped %d legacy (no last_per_1k) entries for uid %s; they relearn on next real request", dropped, logfmt.UID8(uid))
 			}
 		}
 		p.byUID[uid] = e
@@ -247,15 +276,9 @@ func (p *Pool) saveLocked() {
 		p.notePersistFail(err)
 		return
 	}
-	if dir := filepath.Dir(p.stateFp); dir != "" {
-		_ = os.MkdirAll(dir, 0o755)
-	}
-	tmp := p.stateFp + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		p.notePersistFail(err)
-		return
-	}
-	if err := os.Rename(tmp, p.stateFp); err != nil {
+	// 落盘走 safefile：tmp 写入后 fsync、旧文件转 .bak、rename 后再 fsync 目录。
+	// 只做 tmp+rename 时，掉电可能留下长度正确但内容全 0 的 state.json。
+	if err := safefile.WriteAtomic(p.stateFp, raw, 0o600); err != nil {
 		p.notePersistFail(err)
 		return
 	}
@@ -308,6 +331,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			TokenUsage:               e.tokenUsage,
 			SoftStreak:               e.softStreak,
 			SessionDeadFails:         e.sessionDeadFails,
+			DisabledAt:               e.disabledAt,
 			ConsecutiveFails:         e.consecutiveFails,
 			CreditsExpiring:          e.creditsExpiring,
 			CreditsEarliestExpiry:    e.creditsEarliestExpiry,
@@ -334,7 +358,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 				if s.ModelCooldowns == nil {
 					s.ModelCooldowns = map[string]stateModelCooldown{}
 				}
-				s.ModelCooldowns[m] = stateModelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly}
+				s.ModelCooldowns[m] = stateModelCooldown{Until: mc.Until, ResetAt: mc.ResetAt, Reason: mc.Reason, AuditOnly: mc.AuditOnly, Capacity: mc.Capacity}
 			}
 		}
 		// 成本账本：惰性过滤过期观测（modelCostTTL 外不写——陈旧价格不复活）。
@@ -346,7 +370,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 				if s.ModelCosts == nil {
 					s.ModelCosts = map[string]stateModelCost{}
 				}
-				s.ModelCosts[m] = stateModelCost{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
+				s.ModelCosts[m] = stateModelCost{CostPer1k: mc.CostPer1k, LastPer1k: mc.LastPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
 			}
 		}
 		sf.Accounts[uid] = s

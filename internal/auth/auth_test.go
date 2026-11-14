@@ -1,12 +1,14 @@
 package auth
 
 import (
+	"encoding/json"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseNested(t *testing.T) {
@@ -31,6 +33,32 @@ func TestParseFlat(t *testing.T) {
 	}
 }
 
+func TestParseNormalizesExpiresAt(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want int64
+	}{
+		{"nested milliseconds", `{"auth":{"accessToken":"at","expiresAt":1753600000000}}`, 1753600000},
+		{"flat milliseconds", `{"accessToken":"at","expiresAt":1753600000000}`, 1753600000},
+		{"nested seconds unchanged", `{"auth":{"accessToken":"at","expiresAt":1753600000}}`, 1753600000},
+		{"flat seconds unchanged", `{"accessToken":"at","expiresAt":1753600000}`, 1753600000},
+		{"threshold unchanged", `{"accessToken":"at","expiresAt":100000000000}`, 100000000000},
+		{"above threshold converted", `{"accessToken":"at","expiresAt":100000000001}`, 100000000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a, err := Parse([]byte(tt.raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if a.ExpiresAt != tt.want {
+				t.Fatalf("ExpiresAt = %d, want %d", a.ExpiresAt, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseMissingToken(t *testing.T) {
 	if _, err := Parse([]byte(`{"uid":"u3"}`)); err == nil {
 		t.Fatal("want error for missing accessToken")
@@ -51,6 +79,17 @@ func TestSaveAtomicRoundtrip(t *testing.T) {
 	raw, err := os.ReadFile(fp)
 	if err != nil {
 		t.Fatalf("read: %v", err)
+	}
+	var saved struct {
+		Auth struct {
+			ExpiresAt int64 `json:"expiresAt"`
+		} `json:"auth"`
+	}
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatalf("decode saved auth: %v", err)
+	}
+	if saved.Auth.ExpiresAt != a.ExpiresAt {
+		t.Errorf("saved ExpiresAt = %d, want unscaled %d", saved.Auth.ExpiresAt, a.ExpiresAt)
 	}
 	b, err := Parse(raw)
 	if err != nil {
@@ -94,6 +133,24 @@ func TestNeedsRefresh(t *testing.T) {
 	a.ExpiresAt = 9999999999
 	if a.NeedsRefresh(0) {
 		t.Error("far future should not need refresh")
+	}
+
+	raw, err := json.Marshal(map[string]any{
+		"accessToken": "at",
+		"expiresAt":   time.Now().Add(time.Hour).UnixMilli(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.NeedsRefresh(0) {
+		t.Error("millisecond expiry one hour ahead should not need immediate refresh")
+	}
+	if !parsed.NeedsRefresh(2 * time.Hour) {
+		t.Error("millisecond expiry should need refresh within two hours")
 	}
 }
 

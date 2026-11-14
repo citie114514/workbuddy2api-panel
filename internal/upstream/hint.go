@@ -12,6 +12,8 @@ package upstream
 import (
 	"encoding/json"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -47,6 +49,10 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 		return "request context exceeds the model's limit; reduce history/message size"
 	case ErrImageInvalid:
 		return "image request was rejected by upstream; check image_url format and image data"
+	case ErrToolSequence:
+		// 11148：消息序列里 assistant 的 tool_calls 与后续 tool 结果对不上。
+		// 客户端能直接动手修——补齐缺失的 tool 回复，或干脆重开一轮会话。
+		return "tool_calls and tool results do not match; keep every assistant tool_calls paired with matching tool replies, or start a new conversation"
 	case ErrWafBlock:
 		// 账号级 WAF 403 与 IP 级 fail-fast 同 hint：两者对客户端的动作一致
 		// （等待窗口过去再试，换号/立刻重试无意义）。
@@ -63,9 +69,10 @@ func GatewayHint(kind ErrKind, msg string, ctx HintContext) string {
 	case ErrHardCredit:
 		return "account credits exhausted at upstream; waiting for daily check-in to restore"
 	case ErrUpstreamBusy:
-		// 6021 queue.full：渠道级容量满载。措辞明确「不是账号问题、换号无意义」，
-		// 指引客户端等待后重试（SDK 指数退避天然适配）。
-		return "upstream capacity is full (queue.full); this is a channel-level issue, not an account problem; retry after a short wait"
+		// 6020 queue.waiting / 6021 queue.full：渠道级排队/容量满载。措辞明确
+		// 「不是账号问题」，并说明网关已轮转过所有账号（继续换号无意义），
+		// 指引客户端按 Retry-After 等待后重试（SDK 指数退避天然适配）。
+		return "upstream queue is full (6020/6021); this is a channel-level issue, not an account problem; every account was already tried, so retry after the Retry-After delay"
 	case ErrModelBlocked:
 		return "upstream has no such model on this backend; switch model or retry on another account"
 	case ErrContentBlocked:
@@ -113,6 +120,11 @@ func FrameKind(payload string) ErrKind {
 	if IsModelRateLimit(payload) {
 		return ErrSoftRate
 	}
+	// 容量业务码位于 error 信封的独立 code 字段，不能只取 error.message 后分类，
+	// 否则流内 14003/6020/6021 会丢失类型并退化成普通客户端错误。
+	if kind := Classify(http.StatusTooManyRequests, payload); kind == ErrModelBusy || kind == ErrUpstreamBusy {
+		return kind
+	}
 	var f struct {
 		Error struct {
 			Message string `json:"message"`
@@ -153,4 +165,89 @@ func codeMarker(lower, code string) bool {
 		}
 	}
 	return false
+}
+
+// BusinessCode 从上游错误体里取业务错误码（11101/11128/6004 这类）；取不到返回 0。
+//
+// 只取数字码、不取 msg：请求日志的既有约定是「只写元数据，不写响应正文」，
+// 错误码足以定位问题类别（例如 11101 即请求体反序列化失败）。
+func BusinessCode(body []byte) int {
+	if len(body) == 0 || len(body) > 1<<16 {
+		return 0
+	}
+	m := businessCodeRe.FindSubmatch(body)
+	if len(m) < 2 {
+		return 0
+	}
+	n, err := strconv.Atoi(string(m[1]))
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+var businessCodeRe = regexp.MustCompile(`"code"\s*:\s*"?([0-9]{3,6})"?`)
+
+// 官方 classifyErrorDetail（内置 CLI codebuddy-lite-wb.mjs）的确定性码表。
+//
+// 为什么需要这张表：上游把「额度耗尽」「授权过期」「未激活」全都套在 **429** 上返回，
+// 而 429 只说明"这次没成"，不说明原因。只看状态码会把三者一律当成可自愈的软限流：
+//
+//   - 额度耗尽 → 冷却 10 分钟回来还是空，白等；
+//   - 授权过期 → 冷却 → 恢复 → 再失败，无限循环，且日志里看不出真正原因。
+//
+// 官方口径是**业务码优先于状态码**：命中即分类，与 HTTP 状态无关。这里照抄语义，
+// 取码口径同 hasBusinessCode（递归 walk JSON，字符串/数字都认）。
+var (
+	// quotaExhaustedCodes 官方 subcategory = quota_balance_exhausted：
+	// 额度真的用完了，等不来（要靠签到/领包补充）→ 硬冷却到次日 04:00。
+	quotaExhaustedCodes = []string{
+		"14001", // UsageLimitExceeded
+		"14002", // UsageLimitExceeded（另一变体，官方同样归 balance_exhausted）
+		"14012", // UsageLimitExceededEnterprise
+		"14013", // UsageLimitExceededTencent
+		"14014", // UsageLimitEnterpriseExhausted
+		"14018", // UsageLimitUserExhausted
+		"14019", // UsageLimitNoTokenBudget
+	}
+	// accountStateCodes 账号状态问题：授权过期 / 未开通，重试等不来自愈。
+	// 只能重新登录或补完开通流程，因此归账号级故障而非限流。
+	accountStateCodes = []string{
+		"14015", // UsageLimitLicenseExpired —— 官方 category=auth / subcategory=auth_expired
+		"14016", // UsageLimitEnterpriseNotActivated —— quota_not_activated
+		"14017", // UsageLimitUserNotActivated —— quota_not_activated
+	}
+)
+
+// officialCodeKind 按官方码表给出确定性分类；不在表内返回 ErrNone，
+// 由调用方继续走既有判定（文案 / 其他业务码 / 状态码兜底）。
+func officialCodeKind(body string) ErrKind {
+	if !strings.Contains(body, `"code"`) {
+		return ErrNone
+	}
+	for _, c := range quotaExhaustedCodes {
+		if hasBusinessCode(body, c) {
+			return ErrHardCredit
+		}
+	}
+	for _, c := range accountStateCodes {
+		if hasBusinessCode(body, c) {
+			return ErrAccountFault
+		}
+	}
+	return ErrNone
+}
+
+// AccountFaultReason 账号级故障在冷却台账里的原因文案，带上**实际**命中的业务码。
+//
+// 此前 handler 恒写 "account fault (14017)"：码表只有 14017 时没毛病，扩到
+// 14015/14016 之后，授权过期会被标成 trial not activated，面板上看不出真因，
+// 排查方向直接跑偏。
+func AccountFaultReason(body string) string {
+	for _, c := range accountStateCodes {
+		if hasBusinessCode(body, c) {
+			return "account fault (" + c + ")"
+		}
+	}
+	return "account fault"
 }

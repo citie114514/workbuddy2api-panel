@@ -194,54 +194,109 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 		e.until = time.Now().Add(d)
 		e.coolKind = kind
 		e.reason = reason
-		// 非模型级冷却入口：清空会参与路由的模型级冷却，避免上一次
-		// 模型豁免泄漏到账号级冷却上；AuditOnly 条目不影响路由，保留展示。
-		clearRoutingModelCooldownsLocked(e)
+		// 不清 modelCooldowns：账号级冷却与模型级冷冻是**正交**维度。
+		//   - 账号级冷却期间 healthyForModel 末尾的 e.healthy(now) 已保证整号不可选，
+		//     modelExempt 也显式判了 !e.until.IsZero() → 不存在「模型豁免泄漏」，
+		//     当初加清空的理由已不成立；
+		//   - 反之清掉会让「锁到上游重置墙钟」的承诺提前失效：账号在别的模型上吃一次
+		//     429，本模型的 6004/6000 冷冻就被一起抹掉，账号级冷却到期后立刻再撞同一
+		//     模型的限流墙（多号池里表现为「提示 15:22 恢复，2h 后又撞一次」）。
 		p.dirty.Store(true)
 	}
 }
 
-// CooldownSoftForModel 429 的**模型级**软冷却入口（issue #31）：把该模型的冷却截止
-// 精确对齐到上游重置墙钟（不做指数堆加、不做 softStreak 计数）。
-//
-//   - resetAt 非零（带解析时间）→ modelCooldowns[model].Until = min(resetAt,
-//     now+softRateMax)，ResetAt 记录上游原始墙钟（台账 ResetAt）。不写 until
-//     （全账号级冷却不受模型级限流污染），切模型即可用（模型豁免）。
-//   - resetAt 零值（无时间文案）→ 有界退避：base 起按 softStreak 翻倍、封顶
-//     softRateMax，且**在软冷却中**（until 未到期）时不推进/不延长（兜底探测不再把
-//     冷却越堆越厚）。不记录模型（不豁免）。
-//
-// 与旧实现的差异：有上游重置时间时绝对不做指数堆加；无重置时间时，「冷却中兜底
-// 探测再 429」不再 softStreak++ 翻倍——这正是用户「全池被推到 2h 封顶」的元凶。
+// CooldownSoftForModel 429 的模型级软冷却入口。
+// 非空 model 只写 modelCooldowns：明确 resetAt 完整保留，不受 softRateMax 截断；
+// 无墙钟时按该模型 Hits 做有界退避。空模型无法建立路由键，退回账号级软冷却。
 func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time.Time, model, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		now := time.Now()
-		if !resetAt.IsZero() {
-			// 有上游重置时间：冷却截止 = min(resetAt, now+softRateMax)，不做指数放大。
+		if model != "" {
 			if e.modelCooldowns == nil {
 				e.modelCooldowns = map[string]modelCooldown{}
 			}
-			e.modelCooldowns[model] = modelCooldown{
-				Until:   p.cappedSoftUntilLocked(now, resetAt),
-				ResetAt: resetAt,
-				Reason:  reason,
+			if !resetAt.IsZero() {
+				until := resetAt
+				if !until.After(now) {
+					until = now.Add(time.Millisecond)
+				}
+				e.modelCooldowns[model] = modelCooldown{Until: until, ResetAt: resetAt, Reason: reason}
+			} else {
+				hits := e.modelCooldowns[model].Hits + 1
+				e.modelCooldowns[model] = modelCooldown{
+					Until:  now.Add(p.softDurationLocked(base, hits)),
+					Reason: reason,
+					Hits:   hits,
+				}
 			}
 		} else {
-			// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
-			// softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。
-			if e.coolKind != CoolSoft || !now.Before(e.until) {
+			// 空模型无法建立独立路由键，退回账号级冷却。
+			if !resetAt.IsZero() {
+				e.until = p.cappedSoftUntilLocked(now, resetAt)
+			} else if e.coolKind != CoolSoft || !now.Before(e.until) {
 				d := p.softDurationLocked(base, e.softStreak+1)
 				e.softStreak++
 				e.until = now.Add(d)
 			}
 			e.coolKind = CoolSoft
 			e.reason = reason
-			clearRoutingModelCooldownsLocked(e)
+			// 与 Cooldown 同口径：账号级冷却不清模型级冷冻（正交维度）。
 		}
 		p.dirty.Store(true)
 	}
+}
+
+const (
+	modelBusyBase = 10 * time.Second
+	modelBusyMax  = time.Minute
+)
+
+// CooldownModelBusy 记录 14003 的 (账号,模型) 暂时性容量避让。
+// 默认 10 秒起、最多 1 分钟；有效窗口内重复命中不持续延长。显式 Retry-After
+// 也在 1 分钟短窗口内截断。已有更晚的模型冷却不被覆盖或降级成容量类型。
+func (p *Pool) CooldownModelBusy(uid, model string, retryAfter time.Duration, reason string) {
+	if uid == "" || model == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	now := time.Now()
+	old, exists := e.modelCooldowns[model]
+	if exists && !old.AuditOnly && old.Until.After(now) {
+		return
+	}
+	if retryAfter > 0 {
+		if retryAfter > modelBusyMax {
+			retryAfter = modelBusyMax
+		}
+	} else {
+		hits := old.Hits + 1
+		retryAfter = modelBusyBase
+		if hits > 1 {
+			shift := hits - 1
+			if shift > 3 {
+				shift = 3
+			}
+			retryAfter <<= uint(shift)
+			if retryAfter > modelBusyMax {
+				retryAfter = modelBusyMax
+			}
+		}
+		old.Hits++
+	}
+	if e.modelCooldowns == nil {
+		e.modelCooldowns = map[string]modelCooldown{}
+	}
+	e.modelCooldowns[model] = modelCooldown{
+		Until: now.Add(retryAfter), Reason: reason, Hits: old.Hits, Capacity: true,
+	}
+	p.dirty.Store(true)
 }
 
 // RecordModelRateLimitAudit 记录无法参与模型路由的 6004 展示项。
@@ -276,26 +331,36 @@ func (p *Pool) RecordModelRateLimitAudit(uid, model, reason string) {
 	p.dirty.Store(true)
 }
 
-// clearRoutingModelCooldownsLocked 删除参与选号豁免的模型冷却，保留 AuditOnly 台账。
-// 调用方必须已持有 p.mu 写锁。
-func clearRoutingModelCooldownsLocked(e *entry) {
-	for model, mc := range e.modelCooldowns {
-		if !mc.AuditOnly {
-			delete(e.modelCooldowns, model)
-		}
-	}
-	if len(e.modelCooldowns) == 0 {
-		e.modelCooldowns = nil
-	}
-}
-
-// modelBlock TTL 常量（11102 负缓存退避）：
-// 首次命中 6h；半开到期后允许放行重试，再次命中 TTL = base × 2^min(hits-1, shift)；
-// 封顶 24h（最多一天再试一次）。该模型请求成功即由 BlockModelClear 清除。
+// modelBlock TTL 常量（11102/11158 负缓存退避）：首次 15m，之后 base × 2^min(hits-1, 4)，
+// 封顶 2h。该模型请求成功即由 BlockModelClear 清除。
+//
+// 为什么从 6h/24h 收到 15m/2h：11102「service info not found」**不总是**「这个号真没有
+// 这个模型」——路径级差异、上游瞬时抖动、分类误判都会给同一个码，社区实测同一账号两分钟
+// 就恢复。旧参数把一次误判放大成 (账号,模型) 锁死 6 小时：多号池里几个号先后误判，就是
+// 该模型整池 400/503 好几个小时，且 ModelBlockedForRealm 会让客户端看到
+// model_unavailable（"换个模型"）——这个错误结论比等十五分钟贵得多。
+//
+// 为什么不更短（曾试 2m/10m）：对**真的没有这个模型**的号，每次探测都是一轮白撞的 400。
+// 2m/10m 等于稳态每小时探 6 次（一天 144 次），几个号一起就是几百次噪音轮转；15m 把
+// 这项成本压到 1/12（一天 12 次），而误判自愈只比 2 分钟慢 13 分钟。上限 2h 同理：
+// 既要跟上模型目录/权限变化（上游放开权限后最多 2 小时就能用上），又不至于一天只探一次。
+//
+// shift=4 保留：15m × 16 = 4h > 2h，阶梯仍能走到封顶。
 const (
-	modelBlockBaseTTL = 6 * time.Hour
+	modelBlockBaseTTL = 15 * time.Minute
 	modelBlockShift   = 4
-	modelBlockMaxTTL  = 24 * time.Hour
+	modelBlockMaxTTL  = 2 * time.Hour
+
+	// modelBlockAuthTTL 11158「该账号类型无此模型权限」的固定 TTL。
+	//
+	// 与 11102 分开：11102 可能是路径差异/上游抖动/分类误判，几分钟就能自愈，所以
+	// 用短退避；11158 是**授权属性**（账号套餐不含该模型），短时间内不会变，按退避
+	// 反复探测只是每 2 小时往上游打一次注定失败的请求——既占轮转名额，也是一条可
+	// 观测的重复失败。
+	//
+	// 取 24h 而不是永久：套餐/权限会变（续费、活动放开），永久负缓存会让账号在权限
+	// 恢复后再也用不上这个模型，只能人工干预。一天一次探测是成本与自愈速度的折中。
+	modelBlockAuthTTL = 24 * time.Hour
 )
 
 // BlockModelBackoff 11102「该后端无此模型」的 (账号, 模型) 负缓存入口
@@ -323,12 +388,7 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 		hits = e.modelCooldowns[model].Hits
 	}
 	hits++
-	ttl := modelBlockBaseTTL
-	if d := ttl * (1 << uint(min(hits-1, modelBlockShift))); d < modelBlockMaxTTL {
-		ttl = d
-	} else {
-		ttl = modelBlockMaxTTL
-	}
+	ttl := modelBlockTTL(reason, hits)
 	if e.modelCooldowns == nil {
 		e.modelCooldowns = map[string]modelCooldown{}
 	}
@@ -338,6 +398,34 @@ func (p *Pool) BlockModelBackoff(uid, model, reason string) {
 		Hits:   hits,
 	}
 	p.dirty.Store(true)
+}
+
+// modelBlockTTL 按码给负缓存时长：11158 是授权属性（固定 24h），11102 按退避阶梯
+// （首次 15m，翻倍到 2h 封顶）。
+func modelBlockTTL(reason string, hits int) time.Duration {
+	if strings.HasPrefix(reason, "11158") {
+		return modelBlockAuthTTL
+	}
+	ttl := modelBlockBaseTTL
+	if d := ttl * (1 << uint(min(hits-1, modelBlockShift))); d < modelBlockMaxTTL {
+		return d
+	}
+	return modelBlockMaxTTL
+}
+
+// modelBlockMaxTTLFor 该码的负缓存上限（持久化恢复时的存量钳制用）。
+func modelBlockMaxTTLFor(reason string) time.Duration {
+	if strings.HasPrefix(reason, "11158") {
+		return modelBlockAuthTTL
+	}
+	return modelBlockMaxTTL
+}
+
+// modelBlockReason 报告该模型冷却是否属于「确定性拒绝」负缓存（11102/11158）。
+// BlockModelClear（成功即清）与持久化恢复（存量 TTL 钳制）共用同一口径，
+// 避免两处各判一套前缀、改一个漏一个。
+func modelBlockReason(reason string) bool {
+	return strings.HasPrefix(reason, "11102") || strings.HasPrefix(reason, "11158")
 }
 
 // BlockModelClear 清除 (账号, 模型) 的确定性模型拒绝负缓存（11102/11158；该模型
@@ -354,7 +442,7 @@ func (p *Pool) BlockModelClear(uid, model string) {
 		return
 	}
 	mc, exists := e.modelCooldowns[model]
-	if !exists || (!strings.HasPrefix(mc.Reason, "11102") && !strings.HasPrefix(mc.Reason, "11158")) {
+	if !exists || !modelBlockReason(mc.Reason) {
 		return
 	}
 	delete(e.modelCooldowns, model)
@@ -366,10 +454,28 @@ func (p *Pool) BlockModelClear(uid, model string) {
 
 // ModelBlockStatus 描述某模型在全池范围内因模型级冷却而不可选的情况。
 type ModelBlockStatus struct {
-	Blocked bool      // true = 每个非禁用账号都对该模型处于冷却中
-	Reason  string    // 冷却原因（通常为上游原文，如 "11102 model ... not found"）
-	Until   time.Time // 最早解封时间（零值 = 上游未给重置时刻）
-	Count   int       // 因此被挡的账号数
+	Blocked  bool      // true = 每个非禁用账号都对该模型处于冷却中
+	Reason   string    // 冷却原因（通常为上游原文，如 "11102 model ... not found"）
+	Until    time.Time // 最早解封时间（零值 = 上游未给重置时刻）
+	Count    int       // 因此被挡的账号数
+	Capacity bool      // true = 所有阻塞均为 14003 暂时性容量窗口，可 503 重试
+	// QuotaOnly true = 所有阻塞原因都是用量配额（6004/6000）。配额锁在重置前重试
+	// 必然同样失败，是"限流"语义而不是"参数/模型不可用"，故按 429 返回且**不带**
+	// Retry-After——带上会被某些客户端当成"睡多久"的指令，把 20 分钟锁变成 20 分钟
+	// 静默挂起，比报错更难排查。
+	QuotaOnly bool
+}
+
+// isQuotaReason 报告模型级冷却原因是否属于**日级用量配额**（6000 / 6004 TPD /
+// 6008 RPD）。原因字符串由 applyErrorPolicy 写入（"6004 model rate limit" 等）。
+//
+// 只收日级码：6001/6002/6003/6005/6006/6007 是秒/分/小时级瞬时速率窗口，
+// 几分钟就能自愈，按日配额处理会把模型锁到次日，属于过度冷却。
+func isQuotaReason(reason string) bool {
+	reason = strings.TrimSpace(reason)
+	return strings.HasPrefix(reason, "6004") ||
+		strings.HasPrefix(reason, "6008") ||
+		strings.HasPrefix(reason, "6000")
 }
 
 // ModelBlocked 报告该模型是否在全池范围内被模型级冷却挡住。
@@ -401,7 +507,7 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 	defer p.mu.Unlock()
 	now := time.Now()
 
-	var st ModelBlockStatus
+	st := ModelBlockStatus{Capacity: true, QuotaOnly: true}
 	for _, e := range p.byUID {
 		if realm != "" && e.a.Realm() != realm {
 			continue
@@ -417,6 +523,12 @@ func (p *Pool) ModelBlockedForRealm(model, realm string) ModelBlockStatus {
 		}
 		st.Count++
 		if mc, ok := e.modelCooldowns[model]; ok {
+			if !mc.Capacity {
+				st.Capacity = false
+			}
+			if !isQuotaReason(mc.Reason) {
+				st.QuotaOnly = false
+			}
 			if st.Reason == "" {
 				st.Reason = mc.Reason
 			}
@@ -462,7 +574,7 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 		}
 		e.coolKind = CoolSoft
 		e.reason = reason
-		clearRoutingModelCooldownsLocked(e) // 账号级软冷却：清路由豁免，保留审计台账
+		// 与 Cooldown 同口径：账号级软冷却不清模型级冷冻（正交维度）。
 		p.dirty.Store(true)
 	}
 }

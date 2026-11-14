@@ -41,9 +41,18 @@ func NewDNSDialer(servers []string) *net.Dialer {
 }
 
 // SetDNSDialer 把拨号器换到已有的两个 http.Client 上（只覆盖 Transport.DialContext）。
+// 分桶传输层会同时作用于已有桶与后续新建的桶。
 func (c *Client) SetDNSDialer(d *net.Dialer) {
 	if d == nil {
 		return
+	}
+	for _, cl := range []*http.Client{c.HTTP, c.ChatHTTP} {
+		if cl == nil {
+			continue
+		}
+		if ut, ok := cl.Transport.(*uidTransport); ok {
+			ut.SetDialer(d)
+		}
 	}
 	for _, cl := range []*http.Client{c.HTTP, c.ChatHTTP} {
 		if cl == nil {

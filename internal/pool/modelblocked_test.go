@@ -210,3 +210,19 @@ func TestModelBlockedPausedDoesNotMaskBlock(t *testing.T) {
 		t.Errorf("Count=%d want 1（暂停号不计入）", st.Count)
 	}
 }
+
+func TestModelBlockedCapacityOnlyVersusMixed(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.CooldownModelBusy("u1", "m", 0, "14003")
+	p.CooldownModelBusy("u2", "m", 0, "14003")
+	if st := p.ModelBlocked("m"); !st.Blocked || !st.Capacity || st.Count != 2 {
+		t.Fatalf("pure capacity block must be typed and retryable: %+v", st)
+	}
+
+	p.CooldownSoftForModel("u2", time.Minute, time.Now().Add(time.Hour), "m", "6004 model rate limit")
+	if st := p.ModelBlocked("m"); !st.Blocked || st.Capacity || st.Count != 2 {
+		t.Fatalf("mixed capacity/rate-limit block must remain conservative: %+v", st)
+	}
+}

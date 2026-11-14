@@ -23,6 +23,7 @@
 package upstream
 
 import (
+	"encoding/json"
 	"strings"
 )
 
@@ -143,6 +144,50 @@ func backfillReasoningContent(obj map[string]any) {
 	}
 }
 
+// effortValueOff 客户端档位字段是否表达「关闭思考」。off/none 都不在 effortRank 里，
+// 不截住就会被当未知值透传、或被 rank 0 的 off 就近降级成**最弱正档**——「关思考」
+// 反而变成「思考开着但最弱」（实测 effort=off 仍返回 157 字思维链，与 high 的 159 字无异）。
+func effortValueOff(obj map[string]any) bool {
+	for _, k := range []string{"reasoning_effort", "reasoningEffort"} {
+		v, ok := obj[k].(string)
+		if !ok {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(v)) {
+		case "off", "none", "disabled":
+			return true
+		}
+	}
+	return false
+}
+
+// DisableThinkingBody 返回「同一请求、关闭思考」的请求体副本，供空回复救援重发使用。
+//
+// 只对 deepseek 系生效：其它模型没有 thinking 开关语义，改写字段等于引入新的可判别
+// 形态。降级为 disabled 是官方唯一能真正落地关闭的形态（实测 reasoning_effort=off
+// 只降到最弱档，仍会产生思维链）。
+//
+// 解析失败 / 顶层不是对象 / 模型不在该族 → ok=false，调用方放弃救援，行为与未接线
+// 时逐字节一致。
+func DisableThinkingBody(body []byte) ([]byte, bool) {
+	var obj map[string]any
+	if len(body) == 0 || json.Unmarshal(body, &obj) != nil {
+		return nil, false
+	}
+	model, _ := obj["model"].(string)
+	if !isDeepSeekModel(model) {
+		return nil, false
+	}
+	obj["thinking"] = map[string]any{"type": "disabled"}
+	delete(obj, "reasoning_effort")
+	delete(obj, "reasoningEffort")
+	raw, err := json.Marshal(obj)
+	if err != nil {
+		return nil, false
+	}
+	return raw, true
+}
+
 // injectThinking 按 DeepSeek 思维链开关规则改写请求体。非 deepseek 零改动。
 //
 // 核心逻辑（对齐官方客户端）：
@@ -156,6 +201,19 @@ func backfillReasoningContent(obj map[string]any) {
 func injectThinking(obj map[string]any, defaultEffort string) {
 	model, _ := obj["model"].(string)
 	if !isDeepSeekModel(model) {
+		return
+	}
+	// 客户端用档位字段表达关闭（off/none/disabled）：转成 thinking.type=disabled。
+	// 必须在下面的注入之前——否则无 thinking 的请求会先被补 enabled + 默认档，
+	// 降级管线再把 off 就近抬成最弱正档，「关思考」变成「思考开着但最弱」。
+	if effortValueOff(obj) {
+		delete(obj, "reasoning_effort")
+		delete(obj, "reasoningEffort")
+		if th, ok := obj["thinking"].(map[string]any); ok {
+			th["type"] = "disabled"
+		} else {
+			obj["thinking"] = map[string]any{"type": "disabled"}
+		}
 		return
 	}
 	th, ok := obj["thinking"].(map[string]any)

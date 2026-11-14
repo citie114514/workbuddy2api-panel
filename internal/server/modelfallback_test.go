@@ -1,10 +1,19 @@
 package server
 
-// modelfallback_test.go v1.15 模型付费回退端到端：免费额度型模型被 6004 全池
-// 模型级阻塞时，选号改用付费兄弟型号（-sg）重选一次 —— 对齐官方客户端行为。
+// modelfallback_test.go 模型付费回退端到端：免费额度型模型被 6004 全池模型级
+// 配额阻塞时，选号改用付费兄弟型号（-sg）重选一次 —— 对齐官方客户端行为。
+//
+// 移植自 citie114514 fork v1.15；基线换成 integrated 后做了两处适配：
+//  1. 出站请求体在 integrated 上默认 gzip（client.go 压缩默认级别），抓 model
+//     字段前必须先按 Content-Encoding 解压，否则解出来是二进制；
+//  2. 错误口径跟随 integrated：6004/6000/6008 属用量配额，按 429 +
+//     model_quota_exhausted 返回（旧 fork 上是 400 + model_blocked）。
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +22,33 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
+
+// decodeOutbound 解压并解析出站 body 的 model 字段（gzip 或明文）。
+func decodeOutbound(r *http.Request) string {
+	if r.Body == nil {
+		return ""
+	}
+	raw, err := io.ReadAll(r.Body)
+	if err != nil || len(raw) == 0 {
+		return ""
+	}
+	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
+		zr, gerr := gzip.NewReader(bytes.NewReader(raw))
+		if gerr != nil {
+			return ""
+		}
+		if plain, derr := io.ReadAll(zr); derr == nil {
+			raw = plain
+		}
+	}
+	var peek struct {
+		Model string `json:"model"`
+	}
+	if json.Unmarshal(raw, &peek) != nil {
+		return ""
+	}
+	return peek.Model
+}
 
 // newFallbackHandler 构造「主模型已 6004 全池阻塞」的测试环境：
 //   - 单 global 账号，主模型 deepseek-v4.1-flash 被 BlockModelBackoff 锁定；
@@ -24,16 +60,10 @@ func newFallbackHandler(t *testing.T, modelFallbackEnabled bool, custom map[stri
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		return 200, sseOK, true
 	})
-	// 包一层记录出站 body 的 model 字段。
+	// 包一层记录出站 body 的 model 字段（解压后读）。
 	base := up.HTTP.Transport
 	up.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.Body != nil {
-			var peek struct {
-				Model string `json:"model"`
-			}
-			_ = json.NewDecoder(r.Body).Decode(&peek)
-			seenModel.Store(peek.Model)
-		}
+		seenModel.Store(decodeOutbound(r))
 		return base.RoundTrip(r)
 	})
 	g := &auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}
@@ -76,19 +106,19 @@ func TestChatFallsBackToPaidSibling(t *testing.T) {
 	}
 }
 
-// TestChatFallbackDisabled 开关关闭 → 维持既有 model_blocked 口径（503），不出站。
+// TestChatFallbackDisabled 开关关闭 → 维持既有配额阻塞口径（429），不出站。
 func TestChatFallbackDisabled(t *testing.T) {
 	h, seen := newFallbackHandler(t, false, nil)
 	rec := doFallbackRequest(t, h)
-	// 既有口径：模型级阻塞 = 400 model_unavailable（model_blocked 在 gateway_hint）。
-	if rec.Code != http.StatusBadRequest {
+	// integrated 口径：6004 属用量配额 → 429 + model_quota_exhausted。
+	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	if !strings.Contains(rec.Body.String(), "model_blocked") {
-		t.Errorf("body must carry model_blocked hint: %s", rec.Body)
+	if !strings.Contains(rec.Body.String(), "model_quota_exhausted") {
+		t.Errorf("body must carry model_quota_exhausted: %s", rec.Body)
 	}
-	if seen.Load() != nil {
-		t.Errorf("disabled fallback must not hit upstream, model=%v", seen.Load())
+	if got, _ := seen.Load().(string); got != "" {
+		t.Errorf("disabled fallback must not hit upstream, model=%q", got)
 	}
 }
 
@@ -108,28 +138,28 @@ func TestChatFallbackCustomMap(t *testing.T) {
 func TestChatFallbackExplicitDisable(t *testing.T) {
 	h, seen := newFallbackHandler(t, true, map[string]string{"global:deepseek-v4.1-flash": ""})
 	rec := doFallbackRequest(t, h)
-	if rec.Code != http.StatusBadRequest {
+	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	if seen.Load() != nil {
-		t.Errorf("explicitly disabled model must not hit upstream, model=%v", seen.Load())
+	if got, _ := seen.Load().(string); got != "" {
+		t.Errorf("explicitly disabled model must not hit upstream, model=%q", got)
 	}
 }
 
 // TestChatFallbackTargetAlsoBlocked 回退型号也被模型级阻塞 → 一次回退后按
-// model_blocked 收场（不递归 "-sg-sg"、不无限轮转）。
+// 配额阻塞口径收场（不递归 "-sg-sg"、不无限轮转）。
 func TestChatFallbackTargetAlsoBlocked(t *testing.T) {
 	h, seen := newFallbackHandler(t, true, nil)
 	h.cfg.Pool.BlockModelBackoff("u1", "deepseek-v4.1-flash-sg", "6004 model rate limit")
 	rec := doFallbackRequest(t, h)
-	if rec.Code != http.StatusBadRequest {
+	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	if !strings.Contains(rec.Body.String(), "model_blocked") {
-		t.Errorf("body must carry model_blocked hint: %s", rec.Body)
+	if !strings.Contains(rec.Body.String(), "model_quota_exhausted") {
+		t.Errorf("body must carry model_quota_exhausted: %s", rec.Body)
 	}
-	if seen.Load() != nil {
-		t.Errorf("blocked sibling must not hit upstream, model=%v", seen.Load())
+	if got, _ := seen.Load().(string); got != "" {
+		t.Errorf("blocked sibling must not hit upstream, model=%q", got)
 	}
 	// 回退没成功不改写错误口径：hint 仍是模型级阻塞计数 + 上游 6004 原因。
 	if !strings.Contains(rec.Body.String(), "6004 model rate limit") {

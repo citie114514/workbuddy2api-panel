@@ -37,6 +37,12 @@ type Pool struct {
 	exploreLast map[string]time.Time
 	// costExploreEvents 累计探索事件数（/status 透出；pick 写锁内 ++，无需 atomic）。
 	costExploreEvents int64
+	// hangSeen / hangUntil 模型级挂死熔断（见 hang.go）：按 (域, 模型) 记录观察窗内的
+	// 停滞时刻与熔断截止。运行态（不持久化）：重启后重新累计，5 分钟窗口无恢复必要。
+	hangSeen  map[string][]time.Time
+	hangUntil map[string]time.Time
+	// hangTotal 进程内触发的熔断次数（观测用）。
+	hangTotal atomic.Int64
 	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
 	// （SetDegrade 注入；默认值见 defaultDegrade*，issue #114）。
 	degradeThreshold   int
@@ -60,13 +66,18 @@ type Pool struct {
 	// preferExpiring 最早到期优先路由开关（默认 true）。开启且快过期窗口内存在有效
 	// 批次时，选号在成本层内先按最早到期排序；关闭后只使用普通加权路由。
 	preferExpiring bool
+	// expiringWindow 快过期主窗口（config pool.expiring_soon，默认 168h=7 天）。
+	// 与 scheduler 查余额时用的窗口同源：签到/刷新时 upstream 按它算 creditsExpiring。
+	// 选号侧从按日批次自行按任意窗口求和（见 creditsExpiringWithin），因此这里还要
+	// 用于「主窗口无积分 → 放宽回退窗口」的判定。
+	expiringWindow time.Duration
 	// crossDomainFallback 裸模型名跨域回退开关（默认 false = 零回归，issue #135）。
 	// 仅由选号调用方（server handler）读取：开启后，未带 realm 前缀的请求在首选域
 	// 选不到可用号时改用另一域再选一次；显式 cn:/global: 前缀不受影响。
 	crossDomainFallback bool
-	// modelFallbackEnabled 模型付费回退开关（默认 true = 对齐官方客户端，v1.15）。
-	// 模型级阻塞（6004 免费额度用尽等）且存在付费兄弟型号时，选号侧改用回退型号
-	// 重选一次；语义见 ModelFallbackTarget。
+	// modelFallbackEnabled 模型付费回退开关（默认 true = 对齐官方客户端）。
+	// 模型级**配额**阻塞（6004/6000/6008 免费额度用尽等）且存在付费兄弟型号时，
+	// 选号侧改用回退型号重选一次；语义见 ModelFallbackTarget。
 	modelFallbackEnabled bool
 	// modelFallbackCustom 自定义回退映射（"realm:model" → 同域目标裸模型名），
 	// 优先于内置 "-sg" 规则；值空串/等于原模型 = 显式禁用该模型回退。
@@ -108,6 +119,7 @@ func New(stateFp string) *Pool {
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
 		preferExpiring:     true,
+		expiringWindow:     defaultExpiringWindow,
 		degradeThreshold:   defaultDegradeThreshold,
 		degradeCooldown:    defaultDegradeCooldown,
 		degradeCooldownMax: defaultDegradeCooldownMax,
@@ -208,6 +220,17 @@ func (p *Pool) SetPreferExpiring(enabled bool) {
 	p.preferExpiring = enabled
 }
 
+// SetExpiringWindow 注入快过期主窗口（main 从 pool.expiring_soon 解析后调用）。
+// 0 或负数 = 关闭快过期加权（与 prefer_expiring=false 等效），不 panic。
+func (p *Pool) SetExpiringWindow(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.expiringWindow = d
+}
+
 // SetCrossDomainFallback 注入裸模型名跨域回退开关（issue #135；false = 零回归）。
 // 与其它 pool.* 参数一致，面板保存配置后经同一条热应用路径立即生效。
 func (p *Pool) SetCrossDomainFallback(enabled bool) {
@@ -223,8 +246,8 @@ func (p *Pool) CrossDomainFallback() bool {
 	return p.crossDomainFallback
 }
 
-// SetModelFallback 注入模型付费回退配置（v1.15）：开关 + 自定义映射。main 从
-// config 解析后调用，配置热更走同一条路径（与 SetCrossDomainFallback 同风格）。
+// SetModelFallback 注入模型付费回退配置：开关 + 自定义映射。
+// main 从 config 解析后调用，配置热更走同一条路径（与 SetCrossDomainFallback 同风格）。
 // custom 为 nil/空 = 只用内置 "-sg" 规则。
 func (p *Pool) SetModelFallback(enabled bool, custom map[string]string) {
 	p.mu.Lock()
@@ -233,7 +256,7 @@ func (p *Pool) SetModelFallback(enabled bool, custom map[string]string) {
 	p.modelFallbackCustom = custom
 }
 
-// ModelFallbackTarget 返回模型级阻塞时的回退型号（同域裸名）与是否回退。
+// ModelFallbackTarget 返回模型级配额阻塞时的回退型号（同域裸名）与是否回退。
 //
 // 语义对齐官方客户端：免费额度型模型额度用尽后上游报 6004 模型级限流，客户端
 // 自动切到同名付费兄弟型号继续可用（global:deepseek-v4.1-flash → -sg，x0.00 →
@@ -244,7 +267,8 @@ func (p *Pool) SetModelFallback(enabled bool, custom map[string]string) {
 //     不存在的型号不瞎撞）。
 //
 // 调用方（server handler）拿到非空 target 后自行确认可服务性（ServableForModelRealm）
-// 并改写出站 body 的 model 字段。
+// 并改写出站 body 的 model 字段。只在**配额**类阻塞上调用：瞬时容量窗口等一会儿就
+// 自愈，换付费型号是白花钱（由 ModelBlockStatus.QuotaOnly 区分）。
 func (p *Pool) ModelFallbackTarget(realm, model string) (string, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()

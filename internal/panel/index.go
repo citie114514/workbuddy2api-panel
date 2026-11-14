@@ -13,6 +13,8 @@ package panel
 import (
 	_ "embed"
 	"net/http"
+	"net/url"
+	"strings"
 )
 
 //go:embed index.html
@@ -52,18 +54,36 @@ func setSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 }
 
+// versionedIndexHTML 给内嵌静态资源加版本查询参数。无版本号时保持原样
+// （测试或裸用 Panel 不受影响）；正式启动即使版本变化，HTML 也会引用新 URL，
+// 浏览器和 CDN 的旧脚本缓存因此失效。
+func versionedIndexHTML(version string) []byte {
+	if version == "" {
+		return indexHTML
+	}
+	v := url.QueryEscape(version)
+	out := string(indexHTML)
+	out = strings.Replace(out, `href="mobile.css"`, `href="mobile.css?v=`+v+`"`, 1)
+	out = strings.Replace(out, `src="app.js"`, `src="app.js?v=`+v+`"`, 1)
+	out = strings.Replace(out, `src="mobile.js"`, `src="mobile.js?v=`+v+`"`, 1)
+	return []byte(out)
+}
+
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
+// 页面与静态资源均 no-store：无中间缓存时可避免升级后仍执行旧前端。
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(indexHTML)
+	_, _ = w.Write(p.indexHTMLVersioned)
 }
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
 func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(appJS)
 }
@@ -73,6 +93,7 @@ func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) mobileStyle(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/css; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(mobileCSS)
 }
@@ -81,6 +102,7 @@ func (p *Panel) mobileStyle(w http.ResponseWriter, r *http.Request) {
 func (p *Panel) mobileScript(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(mobileJS)
 }

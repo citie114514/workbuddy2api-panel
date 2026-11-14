@@ -1,12 +1,13 @@
 name: docker-ghcr
 
 # 多架构镜像（amd64/arm64）自动构建并发布到 ghcr.io：
-#   - push 到 main / 打 v* tag / 手动触发 → 构建并推送
+#   - push 到 integrated（本仓库默认分支）/ 打 v* tag / 手动触发 → 构建并推送
 #   - PR 触碰构建相关文件 → 仅构建验证，不推送
-# tag 说明：main 推 latest + main + sha-xxxxxx；v1.2.3 推 1.2.3 / 1.2 / 1
+# tag 说明：integrated 推 latest + integrated + sha-xxxxxx；打 v1.2.3 推 1.2.3 + 1.2（无 major 单档）
+# 注意：main 是上游镜像快照（1.13.0），刻意不在此触发，避免误发不含整合的镜像。
 on:
   push:
-    branches: [main]
+    branches: [integrated]
     tags: ["v*"]
   pull_request:
     paths:
@@ -30,7 +31,7 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  # github.repository 自动小写化，得到 ghcr.io/citie114514/workbuddy2api-panel
+  # github.repository 自动小写化，得到 ghcr.io/linguo2625469/workbuddy2api-panel
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:

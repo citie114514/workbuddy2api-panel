@@ -3,13 +3,11 @@
 package auth
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log"
-	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -17,6 +15,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/safefile"
 )
 
 // Auth 是归一化后的账号凭证（来源可以是插件 OAuth 嵌套形或手写扁平形）。
@@ -210,52 +209,12 @@ func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 // 无需加锁——Realm() 加锁是因为 realm/Domain 会被 RefreshToken 在锁内改写。
 func (a *Auth) IsEnterprise() bool { return strings.TrimSpace(a.EnterpriseID) != "" }
 
-// IsEnterpriseSession 报告当前凭证是否处于「企业上下文」：
-// 账号本身是企业版（IsEnterprise），或 AccessToken 签发自**企业切换会话**
-// （JWT payload 带 token_source=enterprise_switch——浏览器在企业空间状态下
-// 完成 OAuth 授权时签发）。
+// IsEnterpriseSession 报告当前凭证是否属于无个人成长体系的企业账号。
 //
-// 为什么单独一站：企业切换会话与真企业版的上游表现**不同**（实测 2026-10-12，
-// 同一时刻与个人号 A/B 对照）——成长任务列表 / 额度查询 / 领养 Buddy 等**读端点
-// 与直连 API 照常**，但 /v2/report 行为事件**返回 200 却被静默丢弃**（15 个成长
-// 任务全部 0/x，重跑并 90s 内逐 15s 回读进度从不跳动），连登 / 签到同样无效。
-// 即「读得见、记不上账」：不跳过则队列每轮白跑全部任务（含真实对话配额）且
-// 无任何报错。因此行为类任务（活跃上报 / 连登 / 旅行 / 夜猫子 / 成长任务执行）
-// 的门控应使用本方法；签到与任务列表扫描不在此列（签到失败是显式报错，
-// 列表扫描实测可用）。额度查询 / 选号 / 保活照常（按 IsEnterprise 口径）。
-//
-// 每次现解码 JWT 而非 Parse 时缓存：RefreshToken 会整体换发 token，
-// 企业切换状态可能随重新授权翻转，缓存会读到过期形态。解码成本仅一次
-// base64 + 小 JSON（每调度轮每账号数次），可忽略。
-func (a *Auth) IsEnterpriseSession() bool {
-	if a.IsEnterprise() {
-		return true
-	}
-	return jwtTokenSource(a.AccessTokenValue()) == "enterprise_switch"
-}
-
-// jwtTokenSource 解出 JWT payload 中的 token_source 声明；非 JWT / 解码失败
-// 一律返回 ""（老 token 与非标准形态按无此声明处理，零回归）。先按无填充
-// base64url 解（JWT 标准），失败再试带填充形态（兼容非标准签发方）。
-func jwtTokenSource(token string) string {
-	parts := strings.Split(token, ".")
-	if len(parts) < 2 {
-		return ""
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		if raw, err = base64.URLEncoding.DecodeString(parts[1]); err != nil {
-			return ""
-		}
-	}
-	var payload struct {
-		TokenSource string `json:"token_source"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return ""
-	}
-	return payload.TokenSource
-}
+// 仅 enterpriseId 非空时门控：token_source=enterprise_switch 也可能出现在未绑定
+// 企业租户的个人账号上，这类账号的行为事件可以正常计分，不能仅凭该声明跳过任务。
+// 保留本方法以兼容既有调用点，语义与 IsEnterprise 一致。
+func (a *Auth) IsEnterpriseSession() bool { return a.IsEnterprise() }
 
 // isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
 // 同时接受裸域 workbuddy.ai 与任意子域（HasSuffix("www.workbuddy.ai") 或裸域本身）。
@@ -345,6 +304,9 @@ func Parse(raw []byte) (*Auth, error) {
 			DeviceToken:  f.DeviceToken,
 		}
 	}
+	if a.ExpiresAt > 100000000000 {
+		a.ExpiresAt /= 1000
+	}
 	if strings.TrimSpace(a.AccessToken) == "" {
 		return nil, fmt.Errorf("parse_error: missing accessToken")
 	}
@@ -386,11 +348,10 @@ func (a *Auth) SaveAtomic() error {
 	if err != nil {
 		return err
 	}
-	tmp := a.FilePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	if err := safefile.WriteAtomic(a.FilePath, raw, 0o600); err != nil {
 		// Docker bind-mount 权限问题的典型现场：容器内 app 用户（uid 10001）
 		// 对宿主机挂载目录无写权限。给出可操作指引而不是裸 syscall 错误。
-		msg := fmt.Sprintf("写入 %s 失败: %v", tmp, err)
+		msg := fmt.Sprintf("写入 %s 失败: %v", a.FilePath, err)
 		if errors.Is(err, fs.ErrPermission) {
 			msg += "\n（Docker 部署：容器内用户对宿主机挂载目录无写权限。解法任选：" +
 				"1) 以本机 uid 运行容器：PUID=$(id -u) PGID=$(id -g) docker compose up -d；" +
@@ -399,7 +360,7 @@ func (a *Auth) SaveAtomic() error {
 		}
 		return errors.New(msg)
 	}
-	return os.Rename(tmp, a.FilePath)
+	return nil
 }
 
 // LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
@@ -416,13 +377,21 @@ func LoadDir(dir string) ([]*Auth, error) {
 	seenUID := make(map[string]string, len(files))
 	var out []*Auth
 	for _, f := range files {
-		raw, err := os.ReadFile(f)
+		// 掉电/写入中断可能留下空或半截文件：主文件不可用时回退同目录的 .bak
+		// （写入侧 safefile.WriteAtomic 每次都会留一份），避免账号"凭空少一个"。
+		raw, usedBak, err := safefile.ReadWithBackup(f, func(b []byte) error {
+			_, perr := Parse(b)
+			return perr
+		})
 		if err != nil {
 			continue
 		}
 		a, err := Parse(raw)
 		if err != nil {
 			continue
+		}
+		if usedBak {
+			log.Printf("WARN: auth %s 不可用，已回退备份 %s.bak", f, f)
 		}
 		a.FilePath = f
 		if prev, ok := seenUID[a.UID]; ok {

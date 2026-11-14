@@ -1,7 +1,9 @@
 package pool
 
 import (
+	"encoding/json"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -91,13 +93,13 @@ func TestCooldownSoftForModelDoesNotClobberUntil(t *testing.T) {
 	}
 }
 
-// TestCooldownSoftForModelCapsUntilKeepsResetAt 6004 写 modelCooldowns：
-// until 截断到 soft_rate_max，reset_at 保留上游原始墙钟（issue #36 台账语义迁移）。
-func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
+// TestCooldownSoftForModelKeepsExplicitResetAt 模型级明确 resetAt 完整保留，
+// 不受账号级 soft_rate_max 截断。
+func TestCooldownSoftForModelKeepsExplicitResetAt(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超封顶 → until 截断到 10m，reset_at 保留 2h
+	reset := time.Now().Add(2 * time.Hour)
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "6004 model rate limit")
 	p.mu.RLock()
 	mc, ok := p.byUID["u1"].modelCooldowns["glm-5.3"]
@@ -105,11 +107,35 @@ func TestCooldownSoftForModelCapsUntilKeepsResetAt(t *testing.T) {
 	if !ok {
 		t.Fatal("modelCooldowns 缺少 glm-5.3")
 	}
-	if rem := mc.Until.Sub(time.Now()); rem <= 0 || rem > 10*time.Minute+time.Second {
-		t.Errorf("Until 应在 (0,10m] 区间，实际剩余 %v", rem)
+	if !mc.Until.Equal(reset) || !mc.ResetAt.Equal(reset) {
+		t.Fatalf("Until=%v ResetAt=%v, want both %v", mc.Until, mc.ResetAt, reset)
 	}
-	if d := mc.ResetAt.Sub(reset); d < -time.Second || d > time.Second {
-		t.Errorf("ResetAt=%v want ~2h 后=%v", mc.ResetAt, reset)
+}
+
+func TestCooldownSoftForModelNoResetUsesPerModelHits(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetSoftRateMax(3 * time.Minute)
+	for i := 0; i < 3; i++ {
+		p.CooldownSoftForModel("u1", time.Minute, time.Time{}, "glm-5.3", "6004 model rate limit")
+	}
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	mc := e.modelCooldowns["glm-5.3"]
+	accountUntil := e.until
+	_, emptyKey := e.modelCooldowns[""]
+	p.mu.RUnlock()
+	if mc.Hits != 3 {
+		t.Fatalf("Hits=%d want 3", mc.Hits)
+	}
+	if rem := time.Until(mc.Until); rem <= 2*time.Minute || rem > 3*time.Minute {
+		t.Fatalf("model cooldown remaining=%v want bounded 3m", rem)
+	}
+	if !accountUntil.IsZero() || emptyKey {
+		t.Fatalf("accountUntil=%v emptyKey=%v", accountUntil, emptyKey)
+	}
+	if !e.healthyForModel(time.Now(), "hy3-x") || e.healthyForModel(time.Now(), "glm-5.3") {
+		t.Fatal("cooldown must be isolated to glm-5.3")
 	}
 }
 
@@ -604,5 +630,104 @@ func TestModelCooldownsPersistCompatOldState(t *testing.T) {
 	}
 	if until.IsZero() {
 		t.Error("旧文件 until 应照常加载（账号级冷却兼容）")
+	}
+}
+
+func TestCooldownModelBusyShortWindowAndSticky(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	p.SetCredits("u1", 2000, 0)
+	p.SetCredits("u2", 1000, 0)
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	p.CooldownModelBusy("u1", "glm-5.3", 0, "14003 model capacity busy")
+
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	mc := e.modelCooldowns["glm-5.3"]
+	accountUntil := e.until
+	p.mu.RUnlock()
+	if !mc.Capacity || !accountUntil.IsZero() {
+		t.Fatalf("14003 must be model capacity only: mc=%+v accountUntil=%v", mc, accountUntil)
+	}
+	if remaining := time.Until(mc.Until); remaining <= 9*time.Second || remaining > 10*time.Second {
+		t.Fatalf("default capacity window=%v want about 10s", remaining)
+	}
+	if got := p.PickExcludingForModel(nil, "glm-5.3"); got == nil || got.UID != "u2" {
+		t.Fatalf("new sessions must avoid capacity-cooled u1, got %+v", got)
+	}
+	if got, why := p.PickStickyForModel("u1", "glm-5.3"); got == nil || got.UID != "u1" || why != StickyPicked {
+		t.Fatalf("existing binding may retry capacity-cooled u1: got=%+v why=%v", got, why)
+	}
+
+	before := mc.Until
+	p.CooldownModelBusy("u1", "glm-5.3", time.Minute, "repeat")
+	p.mu.RLock()
+	after := p.byUID["u1"].modelCooldowns["glm-5.3"].Until
+	p.mu.RUnlock()
+	if !after.Equal(before) {
+		t.Fatalf("active capacity window must not be extended: before=%v after=%v", before, after)
+	}
+}
+
+func TestCooldownModelBusyClampsExplicitRetryAfter(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownModelBusy("u1", "m", 10*time.Minute, "14003")
+	p.mu.RLock()
+	mc := p.byUID["u1"].modelCooldowns["m"]
+	p.mu.RUnlock()
+	if remaining := time.Until(mc.Until); remaining <= 59*time.Second || remaining > time.Minute {
+		t.Fatalf("explicit capacity window=%v want capped at 1m", remaining)
+	}
+
+	p.BlockModelBackoff("u1", "m", "11102 model unavailable")
+	before := p.ModelBlocked("m").Until
+	p.CooldownModelBusy("u1", "m", 0, "14003")
+	after := p.ModelBlocked("m")
+	if !after.Until.Equal(before) || after.Capacity {
+		t.Fatalf("capacity cooldown must not replace longer non-capacity block: before=%v after=%+v", before, after)
+	}
+}
+
+func TestModelCapacityPersistsLocalAndSnapshot(t *testing.T) {
+	fp := filepath.Join(t.TempDir(), "state.json")
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.CooldownModelBusy("u1", "m", 0, "14003")
+	p.Flush()
+
+	p.mu.Lock()
+	raw, err := json.Marshal(snapshot{stateFile: p.stateOverviewLocked(), SavedAt: time.Now()})
+	p.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"capacity":true`) {
+		t.Fatalf("snapshot must persist capacity type: %s", raw)
+	}
+
+	local := New(fp)
+	local.Add(&auth.Auth{UID: "u1"})
+	var snap snapshot
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		t.Fatal(err)
+	}
+	remote := New("")
+	remote.adoptSnapshot(snap)
+	remote.Add(&auth.Auth{UID: "u1"})
+	for name, restored := range map[string]*Pool{"local": local, "snapshot": remote} {
+		t.Run(name, func(t *testing.T) {
+			restored.mu.RLock()
+			mc, ok := restored.byUID["u1"].modelCooldowns["m"]
+			restored.mu.RUnlock()
+			if !ok || !mc.Capacity {
+				t.Fatalf("capacity type lost after restore: %+v ok=%v", mc, ok)
+			}
+			if got, why := restored.PickStickyForModel("u1", "m"); got == nil || why != StickyPicked {
+				t.Fatalf("restored capacity window must retain sticky eligibility: got=%+v why=%v", got, why)
+			}
+		})
 	}
 }

@@ -129,6 +129,27 @@ func TestBoundAccountCooldownReassigns(t *testing.T) {
 	}
 }
 
+func TestStickyUsableKeepsBusyBinding(t *testing.T) {
+	st := newCountingStore()
+	r := New(Config{
+		TTL:          time.Minute,
+		Store:        st,
+		Available:    func() []string { return []string{"other"} },
+		StickyUsable: func(uid, model string) bool { return uid == "busy" },
+	})
+	r.Bind("conv", "busy")
+	for name, resolve := range map[string]func(string, string) (string, bool){
+		"resolve": r.ResolveForModel,
+		"lookup":  r.LookupForModel,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if uid, ok := resolve("conv", "m"); !ok || uid != "busy" {
+				t.Fatalf("busy binding moved to %s ok=%v", uid, ok)
+			}
+		})
+	}
+}
+
 func TestNoSessionKeyPassthrough(t *testing.T) {
 	// ExtractKey 找不到任何会话键 → 空串（调用方据空串走普通 Pick；router 不会被调用）。
 	got := ExtractKey([]byte(`{"model":"x","messages":[]}`))
@@ -273,10 +294,46 @@ func TestBindThenUnbindLifecycle(t *testing.T) {
 	}
 }
 
+// TestTouchCASKeepsNewerBinding 快路径读到 uid 之后、写锁之前，绑定可能已被
+// Bind（粘性跟随成功号）/ Unbind（失败解绑）/ 慢路径重分配改写。touch 必须只在
+// 绑定仍指向入参 uid 时才滚动，否则会把刚解绑的失败号复活、把跟随成功的号冲回
+// 旧号，并经 SetBind 镜像进 Redis（重启后仍是错误绑定）。
+func TestTouchCASKeepsNewerBinding(t *testing.T) {
+	st := newCountingStore()
+	r := routerWith(st, []string{"a1", "a2"}, time.Minute)
+	r.Bind("c1", "a1")
+
+	if r.touch("c1", "a2", time.Now()) {
+		t.Fatal("绑定已不是 a2，过期 uid 的 touch 应放弃")
+	}
+	if u, _ := r.boundUID("c1"); u != "a1" {
+		t.Fatalf("内存绑定被旧 uid 覆盖: %s", u)
+	}
+	if got := st.LoadBinds()["c1"]; got != "a1" {
+		t.Fatalf("镜像绑定被旧 uid 覆盖: %q", got)
+	}
+
+	// 正常路径（uid 一致）仍然滚动并镜像。
+	if !r.touch("c1", "a1", time.Now()) {
+		t.Fatal("uid 一致时 touch 应生效")
+	}
+
+	// 解绑之后不得复活：失败路径先 Unbind，随后到达的 touch 不能把账号写回来。
+	r.Unbind("c1")
+	if r.touch("c1", "a1", time.Now()) {
+		t.Fatal("解绑后 touch 不得复活绑定")
+	}
+	if _, ok := st.LoadBinds()["c1"]; ok {
+		t.Fatal("解绑后镜像不得被复活")
+	}
+	if r.Count() != 0 {
+		t.Fatalf("解绑后不应残留条目，count=%d", r.Count())
+	}
+}
+
 func TestRedisMirrorSetBindCount(t *testing.T) {
 	st := newCountingStore()
 	r := routerWith(st, []string{"a1", "a2"}, time.Minute)
-	r.Resolve("c1")
 	r.Resolve("c1") // 快路径 touch → 又镜像一次
 	if st.setBinds < 1 {
 		t.Errorf("SetBind mirror count=%d want >=1", st.setBinds)

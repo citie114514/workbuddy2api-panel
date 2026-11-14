@@ -30,6 +30,12 @@ func (p *Pool) Disable(uid, reason string) {
 // 即使账号已 disabled，计数仍累计并返回 false 前 N-1 次——但 keepalive 会跳过
 // disabled 号，实际只有「已 disabled 后复活且计数未清」这类场景才会走到这里。
 func (p *Pool) NoteSessionDead(uid string) bool {
+	return p.NoteSessionDeadWith(uid, sessionDeadReason)
+}
+
+// NoteSessionDeadWith 与 NoteSessionDead 共用连续失败计数和三次禁用阈值，
+// 仅允许调用方记录更具体的禁用原因。
+func (p *Pool) NoteSessionDeadWith(uid, reason string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -37,21 +43,28 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 		return false
 	}
 	e.sessionDeadFails++
+	// 计数值本身是持久化状态：不置脏的话，进程在 5s flusher 之前退出会让磁盘残留
+	// 旧计数，重启后一次失败即达阈值误禁账号（"清零点同样落盘"是本文件的承诺）。
+	p.dirty.Store(true)
 	if e.sessionDeadFails < sessionDeadThreshold {
 		return false
 	}
 	e.sessionDeadFails = 0
-	p.disableLocked(e, sessionDeadReason)
+	p.disableLocked(e, reason)
 	return true
 }
 
 // ClearSessionDead 清连续 12153 计数——账号被证明未死的任何时刻调用：
 // refresh 成功（RunKeepaliveNow）、chat 成功（NoteSuccess）、手工复活（ReviveDisabled）。
+//
+// 清零同样必须落盘（且只在真的非零时置脏，避免每次成功都无谓写盘）：否则重启后
+// 残留的旧计数会让刚被成功 refresh 自证活着的账号下一次失败即被禁用。
 func (p *Pool) ClearSessionDead(uid string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
+	if e, ok := p.byUID[uid]; ok && e.sessionDeadFails != 0 {
 		e.sessionDeadFails = 0
+		p.dirty.Store(true)
 	}
 }
 
@@ -241,16 +254,22 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	}
 	const alpha = 0.3
 	prev, seen := e.modelCost[model]
+	last := per1k
 	if !seen {
-		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
+		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastPer1k: &last, LastSeen: time.Now(), Samples: 1}
 	} else {
-		// 限免结束事件（判定在写入口，只看覆盖前值）：此前 tier 0（实测免费，
-		// per1k≤0）且本次实测收费（per1k>0）——账号在该模型上的免费窗口结束。
-		if prev.CostPer1k <= 0 && per1k > 0 {
+		// 判层翻转事件（看覆盖前的 tier，不只看 EMA）：免费→收费是限免窗口结束，
+		// 收费→免费是号重新进免费池。两个方向都要留痕——单向日志正是本 bug 长期
+		// 无人察觉的原因（收费层的号再也观测不到免费，日志里永远只有"开始收费"）。
+		prevTier, nextTier := prev.tier(), modelCostEntry{LastPer1k: &last}.tier()
+		if prevTier != nextTier && nextTier == 2 {
 			log.Printf("[pool] model %s on uid %s: free tier ended, now %.3f credits/1k", model, logfmt.UID8(uid), per1k)
+		} else if prevTier != nextTier && nextTier == 0 {
+			log.Printf("[pool] model %s on uid %s: back to free tier, %.3f credits/1k", model, logfmt.UID8(uid), per1k)
 		}
 		e.modelCost[model] = modelCostEntry{
 			CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
+			LastPer1k: &last,
 			LastSeen:  time.Now(),
 			Samples:   prev.Samples + 1,
 		}
@@ -416,39 +435,46 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 	return uids
 }
 
-// PickByUIDForModel 同 PickByUID，但用 healthyForModel 校验：绑定号在当前模型被
-// 6004 限流时返回 nil，让调用方（handler）解绑并回落普通轮换。
-// 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
-// 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
+// PickByUIDForModel 同 PickByUID，但用 healthyForModel 校验。
 func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
+	a, _ := p.PickStickyForModel(uid, model)
+	return a
+}
+
+// StickyPickResult 区分粘性号临时满载与持久不可用。
+type StickyPickResult int
+
+const (
+	StickyPicked StickyPickResult = iota
+	StickyBusy
+	StickyUnusable
+)
+
+// PickStickyForModel 返回粘性号及未选中的原因。仅在途满载是 StickyBusy，
+// 调用方应保留绑定；账号/模型不健康或积分保底拦截则 StickyUnusable。
+func (p *Pool) PickStickyForModel(uid, model string) (*auth.Auth, StickyPickResult) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
 	if !ok {
-		return nil
+		return nil, StickyUnusable
 	}
 	now := time.Now()
-	if !e.healthyForModel(now, model) {
-		return nil
+	if !e.stickyHealthyForModel(now, model) {
+		return nil, StickyUnusable
 	}
-	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
-	// （判据含上游目录倍率兜底，realm 取账号所属域——粘性号已确定，无需外部传入）。
-	// 返回 nil 后 handler 侧解绑粘性（unbindSticky）走普通轮换换号，粘性号回血
-	// 后下次会话重新绑定。
-	// 日志频次：天然每请求至多一条——首次返回 nil 即解绑，后续轮转不再调入本路径
-	// （无需额外节流）；粘性续期中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
 	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
 		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
 			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
-		return nil
+		return nil, StickyUnusable
 	}
 	if p.inFlightFull(e) {
-		return nil
+		return nil, StickyBusy
 	}
 	e.lastUsed = now
 	p.pickSeq++
 	e.usedSeq = p.pickSeq
-	return e.a
+	return e.a, StickyPicked
 }
 
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
@@ -603,23 +629,23 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 拷贝一份：List 返回后 JSON 序列化在锁外进行，不能与 NoteModelCost 的
 		// 原地扣减共享底层数组（数据竞争）。
 		CreditsExpiryBuckets: append([]ExpiryBucket(nil), e.expiryBuckets...),
-		Cooling:                  now.Before(e.until) || now.Before(e.breakerUntil),
-		Disabled:                 e.disabled,
-		Paused:                   e.paused,
-		SuccessCount:             e.successCount,
-		ErrTotal:                 e.errTotal,
-		CheckinDone:              e.lastCheckinDay == now.Format("2006-01-02"),
-		TokenUsage:               e.tokenUsage,
-		LastSuccessTime:          e.lastSuccess,
-		LastErrTime:              e.lastErr,
-		Until:                    e.until,
-		SoftStreak:               e.softStreak,
-		ModelCosts:               p.modelCostsStatusLocked(e, now),
-		ConsecutiveFails:         e.consecutiveFails,
-		DegradeUntil:             e.degradeUntil,
-		InFlight:                 int(e.inFlight.Load()),
-		BreakerFails:             e.fails,
-		BreakerUntil:             e.breakerUntil,
+		Cooling:              now.Before(e.until) || now.Before(e.breakerUntil),
+		Disabled:             e.disabled,
+		Paused:               e.paused,
+		SuccessCount:         e.successCount,
+		ErrTotal:             e.errTotal,
+		CheckinDone:          e.lastCheckinDay == now.Format("2006-01-02"),
+		TokenUsage:           e.tokenUsage,
+		LastSuccessTime:      e.lastSuccess,
+		LastErrTime:          e.lastErr,
+		Until:                e.until,
+		SoftStreak:           e.softStreak,
+		ModelCosts:           p.modelCostsStatusLocked(e, now),
+		ConsecutiveFails:     e.consecutiveFails,
+		DegradeUntil:         e.degradeUntil,
+		InFlight:             int(e.inFlight.Load()),
+		BreakerFails:         e.fails,
+		BreakerUntil:         e.breakerUntil,
 	}
 	// reason 仅在冷却/禁用中透出（issue #171）：软冷却按 until 到期恢复，
 	// 但 until/coolKind/reason 字段按设计不主动清理（NoteSuccess 注释：
@@ -681,6 +707,7 @@ func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus
 		rows = append(rows, ModelCostStatus{
 			Model:     m,
 			CostPer1k: mc.CostPer1k,
+			LastPer1k: mc.LastPer1k,
 			LastSeen:  mc.LastSeen,
 			Samples:   mc.Samples,
 		})

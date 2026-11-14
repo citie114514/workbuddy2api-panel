@@ -35,28 +35,36 @@ func TestMonitorBodyRenewsOnActivity(t *testing.T) {
 	}
 }
 
-// TestMonitorBodyDisabledWhenIdleZero idle<=0 直接返回原底流。
+// TestMonitorBodyDisabledWhenIdleZero idle<=0 关掉空闲监控（静默不被掐），
+// 但仍保留包装——关闭前的流尾回收是独立策略，不能跟着一起关掉。
 func TestMonitorBodyDisabledWhenIdleZero(t *testing.T) {
 	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	rc := nopCloserBody{Reader: &oneByteReader{}}
-	out := monitorBody(rc, 0, cancel)
-	if _, ok := out.(nopCloserBody); !ok {
-		t.Fatalf("idle<=0 should return underlying body verbatim, got %T", out)
+	src := &oneByteReader{}
+	out := monitorBody(nopCloserBody{Reader: src}, 0, cancel)
+	mb, ok := out.(*idleMonitoringBody)
+	if !ok {
+		t.Fatalf("idle<=0 仍应包装以保留流尾回收，got %T", out)
 	}
 	buf := make([]byte, 1)
 	if _, err := out.Read(buf); err != nil || buf[0] != 'a' {
 		t.Fatalf("read=%q err=%v", buf, err)
 	}
+	if err := out.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	_ = mb
 }
 
 // TestMonitorBodyCloseStopsGoroutine Close 停掉 goroutine，无泄漏（等效监控循环 + 短周期）。
 func TestMonitorBodyCloseStopsGoroutine(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	m := &idleMonitoringBody{
-		rc:       &ctxBoundReader{ctx: context.Background()},
+		rc:       &ctxBoundReader{ctx: ctx},
 		lastRead: time.Now(),
 		stopCh:   make(chan struct{}),
-		cancel:   func() {},
+		cancel:   cancel,
 	}
 	stopped := make(chan struct{})
 	go func() {

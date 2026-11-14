@@ -5,10 +5,35 @@
 package upstream
 
 import (
+	"bytes"
 	"encoding/json"
 	"log"
 	"strings"
 )
+
+// marshalNoEscape 序列化但**不转义 < > &**。
+//
+// 官方客户端是 Node，JSON.stringify 不碰这三个字符；Go 的 json.Marshal 默认把它们
+// 写成 \u003c / \u003e / \u0026。一个 78KB 的系统提示里通常有几十个 <>&（代码、
+// 箭头、比较运算），逐字节对比会差出几百字节——实测官方 77907B，我们 78297B，
+// 差值 390 = 78 字符 × 5，一分不差全来自这里。
+//
+// 该函数只用于**出站请求体**。响应侧仍需默认转义（下游是浏览器/网页环境时
+// \u003c 更安全），不要复用。
+func marshalNoEscape(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	b := buf.Bytes()
+	// Encoder.Encode 末尾补 '\n'（流式编码器语义），JSON body 不要这个换行。
+	if n := len(b); n > 0 && b[n-1] == '\n' {
+		b = b[:n-1]
+	}
+	return b, nil
+}
 
 // PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
 func PrepareBodyOpt(src []byte, sanitize bool) []byte {
@@ -48,6 +73,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	if _, has := obj["stream_options"]; !has {
 		obj["stream_options"] = map[string]any{"include_usage": true}
 	}
+	normalizeStop(obj)
 	normalizeToolChoice(obj)
 	normalizeToolPatterns(obj)
 	normalizeRoles(obj)
@@ -66,6 +92,11 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 		msgs, _ = mergeAdjacentToolCalls(msgs)
 		msgs, _ = repackToolResultBlocks(msgs)
 		msgs, _ = cleanupOrphanToolCalls(msgs)
+		// 空串 content 收尾修复（见 repairEmptyContent）：必须排在 cleanup 之后——
+		// cleanup 摘掉孤儿 tool_calls 后，一条 content:"" 的 assistant 会变成
+		// 「裸空消息」，正是上游 11151 的触发面（tool_pairing_test.go 的
+		// 「空name带结果」用例就是这条路径）。
+		msgs, _ = repairEmptyContent(msgs)
 		// 无改动时两步都返回原 slice，这里回写等于零操作；任一步重排/删除
 		// （哪怕后续步骤零改动）也必须落到 obj——不能只在「最后一步改动」时回写，
 		// 否则 repack 单独生效的结果会被原 slice 覆盖丢失。
@@ -85,11 +116,41 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 			sanitizeMessages(msgs)
 		}
 	}
-	out, err := json.Marshal(obj)
+	out, err := marshalNoEscape(obj)
 	if err != nil {
 		return src
 	}
-	return out
+	// 顶层键序对齐官方客户端插入序（见 keyorder.go）：纯字节重排，长度与语义不变。
+	return reorderTopLevelKeys(out, officialTopLevelOrder)
+}
+
+// normalizeStop 把 `stop` 归一成数组。
+//
+// OpenAI 规范里 stop 是 `string | string[]`（两种都合规），但上游 Go 端字段是
+// `[]string`，收到字符串直接反序列化失败：
+//
+//	{"code":11101,"msg":"Unmarshal chat params failed with error:
+//	 json: cannot unmarshal string into Go struct field Request.stop of type []string"}
+//
+// 实测：`"stop":"END"` → 400 11101；`"stop":["END"]` → 200，这批 400 全部由这一个
+// 原因引起，来源多为按规范发字符串的客户端。
+// 客户端按规范发字符串没有错，这里替上游放宽：字符串包成单元素数组。
+//
+// 只处理字符串这一种：数组原样、空串按「未设置」删掉（`[""]` 对上游是无意义值）、
+// 其它畸形类型不动（留给上游报 11101，不掩盖真正的脏数据）。
+func normalizeStop(obj map[string]any) {
+	v, ok := obj["stop"]
+	if !ok {
+		return
+	}
+	switch t := v.(type) {
+	case string:
+		if t == "" {
+			delete(obj, "stop")
+			return
+		}
+		obj["stop"] = []any{t}
+	}
 }
 
 // translateMaxCompletionTokens 把 OpenAI 别名 max_completion_tokens 翻译为上游
@@ -366,11 +427,11 @@ func ensureConsoleSystem(body []byte) []byte {
 		}
 	}
 	obj["messages"] = append([]any{map[string]any{"role": "system", "content": "You are a helpful assistant."}}, msgs...)
-	out, err := json.Marshal(obj)
+	out, err := marshalNoEscape(obj)
 	if err != nil {
 		return body
 	}
-	return out
+	return reorderTopLevelKeys(out, officialTopLevelOrder)
 }
 
 // normalizeToolChoice 按上游 Go struct（string 类型）改写 OpenAI tool_choice。
@@ -424,29 +485,36 @@ func normalizeToolChoice(obj map[string]any) {
 	}
 }
 
-// normalizeToolPatterns 归一化 tools 子树里 pattern 的非标准转义 `\_`（→ `_`）。
+// normalizeToolPatterns 归一化 tools 声明，两件事：
+//  1. pattern / patternProperties 里 `\_` → `_`（JSON Schema 正则的转义兼容）；
+//  2. 丢弃上游必然整单拒绝的条目（见 validToolName 与下面的服务端工具声明）。
 //
-// 上游对 tools[].function.parameters 做严格 JSON Schema/正则文法校验，pattern 含
-// `\_`（转义的字面量下划线）会整体拒收：400 code=11129 invalid_function_call_
-// parameters（displayMsg「工具定义不合规」）。`\_` 不是任何正则文法的合法转义，
-// 但所有主流引擎（RE2/PCRE/JS Annex B）都宽容地视为 `_` 本身——上游校验器比它们
-// 全部更严（对照 V8 严格文法 u 标志，唯一同样拒绝的实现）。实案：某编码 agent 的 exa 插件
-// agent_run 工具 runId/previousRunId 带 `^agent\_run\_`，deepseek 系全家确定性 400
-// → 网关侧归 ErrClient 只换号不罚但喂连败计数 → 轮转烧满 5 连败触发连败降权、
-// 客户端 503（2026-09-29/30 两次实案）。schema 级拒绝换账号无用，只能在发送前修。
+// 第 2 条的判据来自上游的实错：tools[N].function.name 不合格时整条请求 400
+// （code 11133，extError.param 直指该路径，message 是「the request parameters
+// were rejected by the model provider」）。触发形态有四类：
+//   - 客户端把服务端工具声明（如 {"type":"web_search"}，没有 function 层、也没有
+//     name）与普通 function 工具一起发；
+//   - name 为空；
+//   - name 超过 64 字节；
+//   - name 含 [A-Za-z0-9_-] 之外的字符（点号/斜杠/CJK/空格）。
 //
-// 归一无损：`\_` 与 `_` 在所有引擎匹配语义相同（各引擎实测 + 上游对照探针：归一后
-// 200），工具方功能不变。只动 tools 子树（pattern 值 + patternProperties 键）；
-// 消息正文里的 `\_`（如 Windows 路径 C:\_x）不碰。其余非标转义（`\:` 等）未证实
-// 触发，不扩面——有实案再议。独立于 sanitize 开关：这是「让请求通过」，不是脱敏。
+// 四类都**整条丢弃**，不改写成合法值：改名会让模型吐出的 tool_calls 名字与客户端
+// 声明对不上，把一次显式 400 换成一次静默失效的工具——后者更难排查。
+//
+// 丢弃是 best-effort 且可观测：只丢真正不合格的条目，合法条目原样保留；重名只留
+// 第一条（上游按名索引）；全部被丢时删掉 tools 键；有丢弃就落一行 WARN 带原因。
 func normalizeToolPatterns(obj map[string]any) {
 	rawTools, ok := obj["tools"].([]any)
 	if !ok {
 		return
 	}
+	kept := make([]any, 0, len(rawTools))
+	seen := make(map[string]struct{}, len(rawTools))
+	var dropped []string
 	for _, raw := range rawTools {
 		tool, ok := raw.(map[string]any)
 		if !ok {
+			dropped = append(dropped, "non-object")
 			continue
 		}
 		// OpenAI 形态 tools[].function.parameters；裸 tools[].parameters 兼容。
@@ -454,7 +522,64 @@ func normalizeToolPatterns(obj map[string]any) {
 			unescapePatternLiteralEscapes(fn["parameters"])
 		}
 		unescapePatternLiteralEscapes(tool["parameters"])
+
+		name, ok := toolName(tool)
+		if !ok {
+			dropped = append(dropped, "no-name")
+			continue
+		}
+		if !validToolName(name) {
+			dropped = append(dropped, "bad-name:"+name)
+			continue
+		}
+		if _, dup := seen[name]; dup {
+			dropped = append(dropped, "dup:"+name)
+			continue
+		}
+		seen[name] = struct{}{}
+		kept = append(kept, raw)
 	}
+	if len(dropped) == 0 {
+		return
+	}
+	if len(kept) == 0 {
+		delete(obj, "tools")
+	} else {
+		obj["tools"] = kept
+	}
+	log.Printf("WARN: [upstream] dropped %d unusable tool(s): %s",
+		len(dropped), strings.Join(dropped, ", "))
+}
+
+// toolName 取 tools 条目的名字：优先 function.name（OpenAI 形态），其次裸 name
+// （Anthropic 形态经入口层转换后的残形）。都没有/为空即 false。
+func toolName(tool map[string]any) (string, bool) {
+	if fn, ok := tool["function"].(map[string]any); ok {
+		n, _ := fn["name"].(string)
+		return n, n != ""
+	}
+	n, _ := tool["name"].(string)
+	return n, n != ""
+}
+
+// validToolName 上游 tools[].function.name 的接受域：1..64 字节，只含
+// [A-Za-z0-9_-]。越界即整单 400（code 11133），见 normalizeToolPatterns 注释。
+//
+// 按字节而不是 rune 判长：合法名字都是 ASCII，非 ASCII 名字在上面的字符集判定
+// 里已经先被拒了，这里只负责长度上界。
+func validToolName(s string) bool {
+	if len(s) == 0 || len(s) > 64 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // unescapePatternLiteralEscapes 递归改写 schema 树里 pattern 值与 patternProperties
@@ -488,4 +613,69 @@ func unescapePatternLiteralEscapes(node any) {
 			unescapePatternLiteralEscapes(v)
 		}
 	}
+}
+
+// repairEmptyContent 修掉「content 为空」的 assistant/system 消息——上游 11151
+// "a message has empty content" 的唯一触发面。
+//
+// 实测矩阵（2026-10-24，cn:kimi-k2.7 / kimi-k2.7，同 body 逐形态探测；每组探测
+// 前清 state.json 重启，避免被罚号污染后续判定）：
+//
+//	assistant + ""      + 无 tool_calls → 400 11151
+//	assistant + null    + 无 tool_calls → 400 11151
+//	assistant + 缺键    + 无 tool_calls → 400 11151
+//	system    + ""/null/缺键            → 400 11151
+//	assistant + ""/null/缺键 + 有 tool_calls → 200（tool_calls 消息的标准形状）
+//	assistant + "   "   + 无 tool_calls → 200（空白串不被判空）
+//	assistant + []      + 无 tool_calls → 200
+//	user      + ""      → 200
+//	tool      + ""/null → 200
+//
+// 判据因此不是「content 为空」，而是「assistant/system 且没有 tool_calls 时 content
+// 必须是有内容的字符串」。修法：把这三种空形态换成单空格。
+//
+// 为什么是单空格而不是删消息：
+//   - 条数与顺序零变化，依赖「第 N 条是 user/assistant」的位置语义（prefill、
+//     few-shot 交替约束、reasoning 回填）全不受影响；
+//   - 单空格对模型等价于无内容，语义不变，且实测各模型均放行；
+//   - 删除会改变对话轮次结构，prefill 场景下行为变化不可控。
+//
+// 刻意不动 tool_calls 消息的 content：null 是它的标准形状，改它反而破坏规范形态。
+//
+// 这个修复同时消掉一个隐性损失：修复前该 400 被归为 ErrClient → 罚号 + 轮转，
+// 一条坏请求连坐 MaxRotate(3) 个健康账号进软冷却；修好后请求直接成功，不再罚号。
+// 触发面只限 assistant/system、user/tool 已实测放行，故不扩大改动面。
+func repairEmptyContent(messages []any) ([]any, bool) {
+	if len(messages) == 0 {
+		return messages, false
+	}
+	changed := false
+	for _, m := range messages {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		// 触发面只限 assistant / system（user/tool 空 content 实测放行）。
+		// normalizeRoles 已在管线更早处执行，developer 到这里已是 system。
+		if role, _ := msg["role"].(string); role != "assistant" && role != "system" {
+			continue
+		}
+		// 带 tool_calls 的消息放行：content null 是它的标准形状，不能改。
+		if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
+			continue
+		}
+		switch c := msg["content"].(type) {
+		case nil:
+			// 同时覆盖「键存在但为 null」与「键缺失」（取值为 nil）。
+			msg["content"] = " "
+			changed = true
+		case string:
+			if c == "" {
+				msg["content"] = " "
+				changed = true
+			}
+		}
+		// "   "（空白串）、[]、正常文本一律不动：实测全部放行，改它们只增加风险面。
+	}
+	return messages, changed
 }

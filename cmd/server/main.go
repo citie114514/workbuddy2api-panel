@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/alert"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
@@ -31,8 +32,8 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
-// appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.16.2-panel"
+// appVersion 透出到 /panel/api/overview。
+const appVersion = "1.16.30-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -104,8 +105,9 @@ func main() {
 	p.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring)
+	p.SetExpiringWindow(cfg.ExpiringSoonDur)               // 快过期主窗口（pool.expiring_soon，默认 7 天；主窗口无积分时选号自动放宽到 14 天）
 	p.SetCrossDomainFallback(cfg.Pool.CrossDomainFallback) // 裸名跨域回退（issue #135，默认关闭）
-	p.SetModelFallback(cfg.Pool.ModelFallbackEnabled, cfg.Pool.ModelFallback) // 模型付费回退（v1.15，默认开启）
+	p.SetModelFallback(cfg.Pool.ModelFallbackEnabled, cfg.Pool.ModelFallback) // 模型付费回退（默认开启）
 	_ = p.SetScheduling(cfg.Pool.Strategy, cfg.Pool.AccountOrder)
 
 	// 会话粘性路由（可配关闭）。
@@ -123,6 +125,7 @@ func main() {
 			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏）；
 			// 裸名走 cn（现状零回归）。闭包内部 resolveModel 剥前缀，再按 realm 过滤。
 			AvailableForModel: realmAwareAvailableForModel(p),
+			StickyUsable:      realmAwareStickyUsable(p),
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -136,6 +139,14 @@ func main() {
 	}
 
 	up := upstream.New()
+	// 出站 TLS 形态（见 upstream/tlsfingerprint.go）：默认复刻官方桌面端
+	// ClientHello（JA3 md5 71dc8c53…）。配了出站代理时改为 Go 原生形态——
+	// net/http 一旦看到自定义 DialTLSContext 就会跳过代理直连目标。
+	if upstream.TLSFingerprintActive() {
+		log.Printf("TLS: 出站 ClientHello 复刻官方桌面端（JA3 md5 %s）", upstream.OfficialJA3MD5)
+	} else {
+		log.Printf("TLS: 检测到出站代理，ClientHello 用 Go 原生形态（自定义拨号会绕过代理）")
+	}
 
 	// 积分保底的「收费」兜底判据：接上游模型目录的积分倍率表。本地实测台账无观测
 	// 时用它判收费——否则「没学过」恒等于「放行」，高价新模型会把触底号一笔打穿
@@ -147,9 +158,7 @@ func main() {
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	// 聊天 SSE 首字节前（响应头）上限：cfg 已 normalize（缺省回落 timeout_seconds）。
 	up.HeaderTimeout = time.Duration(cfg.Upstream.HeaderTimeoutSeconds) * time.Second
-	if tr, ok := up.ChatHTTP.Transport.(*http.Transport); ok {
-		tr.ResponseHeaderTimeout = up.HeaderTimeout
-	}
+	up.SetResponseHeaderTimeout(up.HeaderTimeout)
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
@@ -194,8 +203,10 @@ func main() {
 		TravelHours:    cfg.Schedule.TravelHours,
 		ActivityHours:  cfg.Schedule.ActivityHours,
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
-		BlackcatHours:  cfg.Schedule.BlackcatHours,
-		GrowthHours:    cfg.Schedule.GrowthHours,
+		// 排程保活只刷新临期凭证；面板手动全量保活不受影响。
+		KeepaliveRefreshWindow: cfg.KeepaliveRefreshWindowDur,
+		BlackcatHours:          cfg.Schedule.BlackcatHours,
+		GrowthHours:            cfg.Schedule.GrowthHours,
 		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
 		ExpiringSoonWindow: cfg.ExpiringSoonDur,
 		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
@@ -206,6 +217,10 @@ func main() {
 		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
 		// 保号类四任务是否覆盖禁用账号（缺省 false = 禁用即跳过，保持既有行为）。
 		IncludeDisabledInTasks: cfg.Schedule.IncludeDisabledInTasks,
+		// 人味化：周期任务间隔抖动（千分数，0 = 精确固定间隔）与夜猫子参与上限。
+		BalanceRefreshJitterPermill: cfg.Schedule.BalanceRefreshJitterPermill,
+		TaskSweepJitterPermill:      cfg.Schedule.TaskSweepJitterPermill,
+		NightAccountCap:             cfg.Schedule.NightAccountCap,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -228,7 +243,7 @@ func main() {
 	if !cfg.Schedule.KeepaliveEnabled {
 		log.Printf("token 保活已禁用（schedule.keepalive_enabled=false）")
 	} else {
-		log.Printf("token 保活已启用：%v 点", cfg.Schedule.KeepaliveHours)
+		log.Printf("token 保活已启用：%v 点（仅刷新 %s 内临期凭证）", cfg.Schedule.KeepaliveHours, cfg.KeepaliveRefreshWindowDur)
 	}
 	switch {
 	case !cfg.Schedule.BlackcatEnabled:
@@ -259,6 +274,7 @@ func main() {
 		APIKey:               cfg.APIKey,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
+		DebugLogOutboundBody: cfg.Features.DebugLogOutboundBody,
 		RecordClientInfo:     cfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(cfg.Models.Hidden),
 	})
@@ -328,28 +344,43 @@ func main() {
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
+	// 风控信号告警：把 11128 / 403 WAF / 12153 session / 11140 渠道校验推到 webhook。
+	// 未配 webhook 时为 nil，noteRiskSignal 走 nil 短路（零开销）。
+	var alerter *alert.Notifier
+	if cfg.Alert.Enabled {
+		alerter = alert.New(cfg.Alert.Webhook, cfg.Alert.Token, time.Duration(cfg.Alert.MinIntervalSeconds)*time.Second)
+		if alerter != nil {
+			log.Printf("alert: 风控信号告警已启用（静默窗口 %ds）", cfg.Alert.MinIntervalSeconds)
+		} else {
+			log.Printf("WARN: alert.enabled=true 但 webhook 为空，告警不会推送")
+		}
+	}
+
 	h := server.NewHandler(server.Config{
-		Pool:         p,
-		Upstream:     up,
-		APIKey:       cfg.APIKey,
-		Session:      sessRouter,
-		StickyCount:  sessCount,
-		RedisMode:    redisMode,
-		SoftCooldown: cfg.SoftRateDur,
-		Panel:        pn,
-		Live:         live,
-		Usage:        rec,
-		RequestLog:   requestLog,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
+		Pool:               p,
+		Upstream:           up,
+		APIKey:             cfg.APIKey,
+		Session:            sessRouter,
+		StickyCount:        sessCount,
+		RedisMode:          redisMode,
+		SoftCooldown:       cfg.SoftRateDur,
+		TimeoutRotateExtra: cfg.TimeoutRotateExtra,
+		Panel:              pn,
+		Live:               live,
+		Usage:              rec,
+		RequestLog:         requestLog,
+		PromptMode:         cfg.Prompt.Mode,
+		PromptText:         cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
-		RecordClientInfo: cfg.Logging.RequestClientInfo,
+		RecordClientInfo:     cfg.Logging.RequestClientInfo,
+		DebugLogOutboundBody: cfg.Features.DebugLogOutboundBody,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 		// 模型黑名单原始条目；运行期以 livecfg 快照为准（热生效），此处供
 		// Live 为 nil 的裸用/测试路径。
 		ModelsHidden: cfg.Models.Hidden,
+		Alert:        alerter,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -384,13 +415,24 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// 关停窗口可配（缺省 30s）：在途 SSE 的合法时长可达分钟级，旧的固定 5s
+		// 必然把在途流掐成连接重置。超时不再静默——被放弃的在途请求要能从日志看出来。
+		window := cfg.ServerShutdownTimeoutDur
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), window)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			// 0 窗口是显式「立即退出」，不算异常；其余超时要留 WARN。
+			if window > 0 {
+				log.Printf("WARN: shutdown window %s elapsed, in-flight requests abandoned: %v", window, err)
+			}
+		}
 	}()
 
 	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		// log.Fatalf 走 os.Exit，defer 不会执行：先把池状态落盘再退出，
+		// 否则监听失败这类启动期故障会连带丢掉整轮冷却/成本/用量状态。
+		p.Flush()
 		log.Fatalf("http: %v", err)
 	}
 	log.Printf("bye")
@@ -452,7 +494,7 @@ func panelListenPath(listen string) string {
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
 //   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval/SetPreferExpiring/SetCreditFloor
-//   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetExpiringSoonWindow
+//   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetExpiringSoonWindow/SetKeepaliveRefreshWindow
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
 //   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.*（TTL 类）
@@ -524,6 +566,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		APIKey:               newCfg.APIKey,
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
+		DebugLogOutboundBody: newCfg.Features.DebugLogOutboundBody,
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 		HiddenModels:         livecfg.NormalizeHiddenModels(newCfg.Models.Hidden),
 	})
@@ -537,10 +580,12 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
+	p.SetExpiringWindow(newCfg.ExpiringSoonDur)               // 快过期主窗口热生效
 	p.SetCrossDomainFallback(newCfg.Pool.CrossDomainFallback) // 裸名跨域回退热生效（issue #135）
-	p.SetModelFallback(newCfg.Pool.ModelFallbackEnabled, newCfg.Pool.ModelFallback) // 模型付费回退热生效（v1.15）
+	p.SetModelFallback(newCfg.Pool.ModelFallbackEnabled, newCfg.Pool.ModelFallback) // 模型付费回退热生效
 	_ = p.SetScheduling(newCfg.Pool.Strategy, newCfg.Pool.AccountOrder)
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
+	sch.SetKeepaliveRefreshWindow(newCfg.KeepaliveRefreshWindowDur)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
 		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,
@@ -551,6 +596,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 	sch.SetTaskSweepInterval(newCfg.TaskSweepInterval)
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
+	sch.SetJitter(newCfg.Schedule.BalanceRefreshJitterPermill, newCfg.Schedule.TaskSweepJitterPermill)
+	sch.SetNightAccountCap(newCfg.Schedule.NightAccountCap)
 
 	return restartRequiredFields(newCfg), nil
 }
@@ -578,6 +625,7 @@ func restartRequiredFields(c *Config) []string {
 		out = append(out, "state_file")
 	}
 	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds")
+	out = append(out, "timeout_rotate_extra")
 	// upstream.user_agent 在装配期被写进出站 client（main.go 的 up.UserAgent = ...），
 	// 之后不再读取——不在 livecfg 热快照里，也无法热改。此前漏列，导致面板改完
 	// 显示"已保存"却不提示需要重启，用户以为没生效（issue #102 附带发现 2）。

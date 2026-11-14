@@ -83,12 +83,16 @@ func TestSearchRequestShape(t *testing.T) {
 	if v := got.Get("X-User-Id"); v != "u1" {
 		t.Errorf("X-User-Id=%q want u1", v)
 	}
-	// 会话头族（复用 ChatHeaders）：X-Conversation-Message-ID 与 X-Request-ID 同值。
+	// 会话头族（复用 ChatHeaders）：Message-ID 与 X-Request-ID **同值**且都是 32 hex
+	// （CLI 内核 `q = randomUUID().replace(/-/g,"")`，两个头吃同一个值）。
 	if got.Get("X-Conversation-Request-ID") == "" {
 		t.Error("X-Conversation-Request-ID must be set (轮级聚合主键)")
 	}
-	if got.Get("X-Request-ID") == "" || got.Get("X-Conversation-Message-ID") != got.Get("X-Request-ID") {
-		t.Error("X-Conversation-Message-ID 必须与 X-Request-ID 同值")
+	if got.Get("X-Request-ID") == "" || got.Get("X-Conversation-Message-ID") == "" {
+		t.Error("X-Request-ID 与 X-Conversation-Message-ID 都必须非空")
+	}
+	if got.Get("X-Conversation-Message-ID") != got.Get("X-Request-ID") {
+		t.Error("两者应同值（CLI 内核两个头共用一个 q）")
 	}
 }
 
@@ -228,7 +232,7 @@ func TestSearchHTTPErrorClassified(t *testing.T) {
 		body   string
 		want   ErrKind
 	}{
-		{http.StatusUnauthorized, `<html>401 Authorization Required</html>`, ErrClient},
+		{http.StatusUnauthorized, `<html>401 Authorization Required</html>`, ErrSessionDead},
 		{http.StatusTooManyRequests, `{"code":429,"msg":"rate limit exceeded, will reset in 60s"}`, ErrSoftRate},
 		{http.StatusInternalServerError, `{"code":500,"msg":"internal error"}`, ErrServer},
 	}

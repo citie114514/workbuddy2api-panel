@@ -92,6 +92,13 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 			maxCredits = e.credits
 		}
 	}
+	// 快过期名次：本轮所有候选共用一份（按域算，不看 tried/在途），使 top5 截断排序
+	// 与后续加权抽签共享同一档位——两阶段权重必须可比，否则截断进 top5 的号和抽签
+	// 认为「该被优先」的号会错位。
+	expRank := map[string]int(nil)
+	if p.preferExpiring {
+		expRank = p.expiringRankLocked(now, p.expiringWindowLocked(now, realm), realm)
+	}
 	// 成本分层（reqModel 非空时）：按该模型的实测扣费把候选分层，只保留最优层。
 	//   0 = 已实测免费（限免期/夜间免费的号，最强偏好）
 	//   1 = 无观测（含观测过期）
@@ -105,10 +112,9 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if !ok {
 			return 1, 0
 		}
-		if mc.CostPer1k <= 0 {
-			return 0, 0
-		}
-		return 2, mc.CostPer1k
+		// 判层用最近一次原始观测（mc.tier()），不用 EMA：见 modelCostEntry.tier 的
+		// 数学说明——EMA 判层会让收费层号码永远回不到免费层。
+		return mc.tier(), mc.CostPer1k
 	}
 	bestTier := 2
 	hasTier1 := false
@@ -156,7 +162,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	for _, e := range cands {
 		ti, ci := costTier(e)
 		if ti == bestTier {
-			ws = append(ws, weighted{e: e, w: p.routingWeightOf(e, maxCredits, now), tier: ti, cost1k: ci})
+			ws = append(ws, weighted{e: e, w: p.routingWeightOf(e, maxCredits, now, expRank[e.a.UID]), tier: ti, cost1k: ci})
 		}
 	}
 	if strategy := p.strategyForRealmLocked(realm); strategy != WeightedRandom {
@@ -236,7 +242,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 			}
 		}
 	} else {
-		e = p.pickWeighted(eligible) // eligible 保序 = top5 降序子集
+		e = p.pickWeighted(eligible, expRank) // eligible 保序 = top5 降序子集
 	}
 	if explored {
 		// 探索事件日志（可观测性）：选中号此时才确定，故在选中点打出。
@@ -248,6 +254,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
 	p.pickSeq++
 	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
+	notePickLocked(e, now)
 	return e.a
 }
 
@@ -284,9 +291,10 @@ func (p *Pool) floorBlockedForRealmModel(e *entry, model, realm string, now time
 	if p.creditFloor <= 0 || model == "" || e.credits >= p.creditFloor {
 		return false
 	}
-	// 1) 本地实测台账：最权威（真实扣费证据）。
+	// 1) 本地实测台账：最权威（真实扣费证据）。判层同选号口径（最近一次原始观测），
+	//    否则会出现"选号认为免费、保底认为收费"两套结论。
 	if mc, ok := e.modelCostOf(model, now); ok {
-		return mc.CostPer1k > 0
+		return mc.tier() == 2
 	}
 	// 2) 上游目录倍率兜底：无实测观测时用牌价判收费，堵住「无观测 = 放行」漏洞。
 	if p.modelRateOf == nil {
@@ -330,6 +338,14 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		if p.floorBlockedForRealmModel(e, model, realm, now) {
 			continue // 积分保底：触底号不接收费模型（兜底路径同判据）
 		}
+		if e.modelCooled(now, model) {
+			// 模型级冷冻（6004 / 11102）只写 modelCooldowns、不写账号级 until，而兜底
+			// 候选只看 expiry：不判这一条，一个「账号级冷却残留 + 该模型冷冻」的号会被
+			// 兜底捞回来，集中打一次必然 429 的请求。v1.16.5 起账号级冷却不再清模型
+			// 冷冻，这个组合从「几乎不可能」变成峰值时的常态，必须在最后一道选号路径
+			// 挡住——前面挡不住就等于没挡。
+			continue
+		}
 		if p.inFlightFull(e) {
 			continue
 		}
@@ -345,13 +361,14 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 		return nil
 	}
 	log.Printf("WARN: [pool] fallback_earliest_expiry acct=%s until=%s kind=%s", logfmt.Label(best.a.UID, best.a.Nickname), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
-	best.lastUsed = time.Now()
+	best.lastUsed = now
 	// 兜底同样是「选中」，必须与 pick() 正常路径、粘性命中路径（PickByUIDForModel）
 	// 一样推进 usedSeq/pickSeq：否则被兜底反复选中的账号 usedSeq 恒为 0，在 pick 的
 	// LRU 兜底（按 usedSeq 取最旧）眼里永远是「最旧」，刚被用过就被立刻再选——
 	// 防集中/防惊群失效（entry.usedSeq 契约：每次被选中时取 p.pickSeq 自增值）。
 	p.pickSeq++
 	best.usedSeq = p.pickSeq
+	notePickLocked(best, now)
 	return best.a
 }
 
@@ -369,6 +386,38 @@ func (p *Pool) inFlightFull(e *entry) bool {
 // 生产默认 100ms；纯加权分布测试可临时置 0 关闭防撞号。
 var minPickGap = 100 * time.Millisecond
 
+// 选号负载均衡：余额权重只反映存量，不反映最近的使用节奏。窗口内被选次数
+// 越多，权重按 1/(1+decay×count) 下调，使新选号自然摊向少用账号。参数固定
+// 在代码内，不暴露配置；会话粘性命中不经过 pick，因此不会拆散已有会话。
+const (
+	fairnessWindow = time.Hour
+	fairnessCap    = 16
+	fairnessDecay  = 0.25
+)
+
+// notePickLocked 给一次选中打点，环形保留窗口内最近 fairnessCap 次。调用方须持 p.mu。
+func notePickLocked(e *entry, now time.Time) {
+	e.pickStamps = append(e.pickStamps, now)
+	if n := len(e.pickStamps); n > fairnessCap {
+		e.pickStamps = e.pickStamps[n-fairnessCap:]
+	}
+}
+
+// loadFairnessLocked 返回负载惩罚因子 ∈ (0,1]，并惰性清理窗口外时间戳。
+// 调用方须持 p.mu 写锁。
+func loadFairnessLocked(e *entry, now time.Time) float64 {
+	if n := len(e.pickStamps); n > 0 {
+		cut := 0
+		for cut < n && now.Sub(e.pickStamps[cut]) > fairnessWindow {
+			cut++
+		}
+		if cut > 0 {
+			e.pickStamps = append(e.pickStamps[:0], e.pickStamps[cut:]...)
+		}
+	}
+	return 1 / (1 + fairnessDecay*float64(len(e.pickStamps)))
+}
+
 // pickWeighted 加权随机（claude-api selectWeightedRandom 参考口径）：
 //
 //		weight = credits 比例 × 10 + idleWeight
@@ -379,7 +428,7 @@ var minPickGap = 100 * time.Millisecond
 // credits 全 0 时仍按 idleWeight 加权（不退化均匀随机）。
 // 权重为浮点，用 int64 定点（×1e6）抽签可保持确定性随机源注入（randInt64N 语义不变）。
 // 随机源优先用 p.randInt64N（仅供测试注入确定性），nil 时回退 math/rand/v2 全局源。
-func (p *Pool) pickWeighted(cands []*entry) *entry {
+func (p *Pool) pickWeighted(cands []*entry, expRank map[string]int) *entry {
 	now := time.Now()
 	var maxCredits int64
 	for _, e := range cands {
@@ -391,7 +440,7 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 	weights := make([]int64, len(cands))
 	var total int64
 	for i, e := range cands {
-		w := p.routingWeightOf(e, maxCredits, now)
+		w := p.routingWeightOf(e, maxCredits, now, expRank[e.a.UID])
 		weights[i] = int64(w * scale)
 		total += weights[i]
 	}
@@ -437,23 +486,150 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	// 3.（原「成功率 ×3」因子已删，对齐上游 success-ema-review：errTotal 是终身
 	// 累计、只增不减，成功率 = successCount/(successCount+errTotal) 会让早期出过错
 	// 的号被永久压权且永不恢复；瞬时健康信号已由冷却/熔断/连败降权承接。）
+	// 4. 窗口内被选次数降权：高余额号若近期被反复选中，也要把新流量让给少用号。
+	w *= loadFairnessLocked(e, now)
 	return w
 }
 
-// expiringNow 报告账号是否存在当前仍有效的快过期积分批次。
-func expiringNow(e *entry, now time.Time) bool {
-	return e.creditsExpiring > 0 &&
-		e.creditsEarliestRemaining > 0 &&
-		!e.creditsEarliestExpiry.IsZero() &&
-		e.creditsEarliestExpiry.After(now)
+// defaultExpiringWindow 快过期主窗口的池内默认值，与 config 的 pool.expiring_soon
+// 默认（168h）一致。main 启动时会用配置值覆盖（SetExpiringWindow）。
+const defaultExpiringWindow = 168 * time.Hour
+
+// expiringFallbackWindow 主窗口内全池都没有到期积分时的回退窗口。
+//
+// 为什么需要回退：官方积分批次常是「同一波签到、十几天后同批到期」，7 天主窗口在批次
+// 中段会整段为空——此时所有账号权重都是 1，等于快过期偏好完全失效；等到批次真的进入
+// 7 天窗口才开始加权，剩下的时间又不够把积分花完。放宽到 14 天后，偏好会提前介入，
+// 主窗口一有账号进入就立刻切回（更急的那批优先）。
+const expiringFallbackWindow = 14 * 24 * time.Hour
+
+// expiringLadder 快过期账号按紧迫度排名的阶梯权重（第 1..5 名）。
+//
+// 改造前是「窗口内一律 ×3」——号一多，绝对权重仍由余额决定，最急的号反而可能进不了
+// top5 短名单（余额高的号乘完更大）。阶梯把加成集中到最急的五个：第 1 名 ×8、逐级
+// 递减到第 5 名 ×3；第 6 名及以后回到 expiringTailSlots（与改造前一致，不降权）。
+var expiringLadder = [...]float64{8, 6, 5, 4, 3}
+
+// expiringTailSlots 排名第 6 及以后的权重：与改造前统一 ×3 相同。
+const expiringTailSlots = 3
+
+// creditsExpiringWithin 返回该账号在 (now, now+window] 内到期的可用积分合计。
+//
+// 从按日批次自行求和，而不是读上游按单一窗口算好的 creditsExpiring：回退窗口需要按
+// 14 天重算，批次是官方下发的全量未来到期日，窗口只是视角。
+//
+// 无批次时回退到 creditsExpiring（旧入口 SetCreditsDetailed 写入、或企业号快照为空）：
+// 那是上游按主窗口算出的值，只在窗口等于主窗口时同口径；用在回退窗口上会低估，
+// 表现为「回退不生效」而不是错误加权。
+func creditsExpiringWithin(e *entry, now time.Time, window time.Duration) int64 {
+	if window <= 0 {
+		return 0
+	}
+	if len(e.expiryBuckets) == 0 {
+		return e.creditsExpiring
+	}
+	limit := now.Add(window)
+	var n int64
+	for _, b := range e.expiryBuckets {
+		if b.Remain <= 0 || b.ExpireAt.IsZero() || !b.ExpireAt.After(now) || b.ExpireAt.After(limit) {
+			continue
+		}
+		n += b.Remain
+	}
+	return n
 }
 
-// routingWeightOf 在普通账号权重上叠加快过期虚拟实例数量。prefer_expiring=false
-// 或账号无有效快过期批次时，实例数恒为 1，结果与旧 weightOf 完全一致。
-func (p *Pool) routingWeightOf(e *entry, maxCredits int64, now time.Time) float64 {
+// expiringWindowLocked 返回本次选号实际生效的快过期窗口：该域内主窗口还有到期积分就用
+// 主窗口，一点都没有才放宽到回退窗口。调用方须持 p.mu（只读遍历）。
+//
+// 判定按域（realm）而非全池：跨域回退打开时两域各有各的候选集，用全池口径会让一个域的
+// 批次把另一个域的窗口锁死在窄区间。
+func (p *Pool) expiringWindowLocked(now time.Time, realm string) time.Duration {
+	main := p.expiringWindow
+	if main <= 0 {
+		return 0
+	}
+	if expiringFallbackWindow <= main {
+		return main // 配置的主窗口已经够宽，回退无意义
+	}
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if creditsExpiringWithin(e, now, main) > 0 {
+			return main
+		}
+	}
+	return expiringFallbackWindow
+}
+
+// expiringRankLocked 计算域内快过期账号的紧迫度排名（uid → 1..n，仅含窗口内有到期
+// 积分的账号）。排序键：最早到期时间升序（越早越急）→ 该批剩余量降序（浪费得多先花）
+// → uid（稳定兜底）。调用方须持 p.mu。
+//
+// 排名只看池内状态，不看本次请求的 tried/在途过滤：同一时刻所有请求看到同一名次，
+// 换号重试时不会因为前一个号被排除就让别人的档位整体上移。
+func (p *Pool) expiringRankLocked(now time.Time, window time.Duration, realm string) map[string]int {
+	if window <= 0 {
+		return nil
+	}
+	type cand struct {
+		uid string
+		at  time.Time
+		rem int64
+	}
+	cs := make([]cand, 0, len(p.byUID))
+	for uid, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if e.creditsEarliestExpiry.IsZero() || !e.creditsEarliestExpiry.After(now) {
+			continue
+		}
+		if e.creditsEarliestRemaining <= 0 {
+			continue
+		}
+		if creditsExpiringWithin(e, now, window) <= 0 {
+			continue
+		}
+		cs = append(cs, cand{uid: uid, at: e.creditsEarliestExpiry, rem: e.creditsEarliestRemaining})
+	}
+	if len(cs) == 0 {
+		return nil
+	}
+	sort.Slice(cs, func(i, j int) bool {
+		if !cs[i].at.Equal(cs[j].at) {
+			return cs[i].at.Before(cs[j].at)
+		}
+		if cs[i].rem != cs[j].rem {
+			return cs[i].rem > cs[j].rem
+		}
+		return cs[i].uid < cs[j].uid
+	})
+	out := make(map[string]int, len(cs))
+	for i, c := range cs {
+		out[c.uid] = i + 1
+	}
+	return out
+}
+
+// expiringSlots 名次对应的权重倍数（0 名 = 不在窗口内 → 1 倍，不改变原权重）。
+func expiringSlots(rank int) float64 {
+	if rank <= 0 {
+		return 1
+	}
+	if rank <= len(expiringLadder) {
+		return expiringLadder[rank-1]
+	}
+	return expiringTailSlots
+}
+
+// routingWeightOf 在普通账号权重上按快过期名次叠加倍数。prefer_expiring=false、
+// 窗口为空或账号不在窗口内时倍数为 1，结果与旧 weightOf 完全一致。
+func (p *Pool) routingWeightOf(e *entry, maxCredits int64, now time.Time, rank int) float64 {
 	w := p.weightOf(e, maxCredits, now)
-	if p.preferExpiring && expiringNow(e, now) {
-		return w * expiringVirtualSlots
+	if p.preferExpiring {
+		return w * expiringSlots(rank)
 	}
 	return w
 }

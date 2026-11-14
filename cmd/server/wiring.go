@@ -22,3 +22,11 @@ func realmAwareAvailableForModel(p *pool.Pool) func(model string) []string {
 		return p.WeightedAvailableUIDsForModelRealm(bare, realm)
 	}
 }
+
+// realmAwareStickyUsable 校验已有绑定的持续健康，不把临时在途满载当作失效。
+func realmAwareStickyUsable(p *pool.Pool) func(uid, model string) bool {
+	return func(uid, model string) bool {
+		realm, bare := server.ResolveModel(model)
+		return p.StickyEligibleForModelRealm(uid, bare, realm)
+	}
+}

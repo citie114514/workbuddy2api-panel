@@ -17,6 +17,9 @@ import (
 // 只有 CI 恰好落在 UTC 夜里才真正执行。属典型的「随环境静默失效」的测试。
 var nowForNightWindow = time.Now
 
+// NightAccountCap 当前夜猫子参与上限（0 = 不限）。
+func (s *Scheduler) NightAccountCap() int { return int(s.nightCap.Load()) }
+
 // RunBlackcatNow 对所有可用账号执行夜猫子对话补足（窗口外跳过）。
 // 由 blackcat_hours 排程（默认 [23]）触发；执行前二次校验 InNightWindow。
 func (s *Scheduler) RunBlackcatNow() {
@@ -24,7 +27,14 @@ func (s *Scheduler) RunBlackcatNow() {
 		log.Printf("blackcat: 当前不在 23:00–08:00 计数窗口，跳过")
 		return
 	}
-	for _, st := range s.cfg.Pool.List() {
+	// 参与面收窄（schedule.night_account_cap，缺省 0 = 不限）：夜间真实对话只让
+	// 积分最高的前 N 个账号做，其余账号夜里静默——真人不会全部账号都在夜里有活动。
+	// 白天任务（签到/旅行/成长）仍全池保号，不受本项影响。
+	list := capByCredits(s.cfg.Pool.List(), s.NightAccountCap())
+	if cap := s.NightAccountCap(); cap > 0 && len(list) < len(s.cfg.Pool.List()) {
+		log.Printf("blackcat: 夜猫子参与上限 %d（池内 %d 个账号，其余夜间静默）", cap, len(s.cfg.Pool.List()))
+	}
+	for _, st := range list {
 		// 暂停选号（paused）账号跳过：夜猫子是全任务体系中唯一「整任务都是
 		// 真实模型对话」的（RunNightChats 逐条 ChatStream 发 glm-5.2 短对话），
 		// 与「让位防风控」正面冲突。旅行/成长任务都是纯上报或领奖 RPC，照常跑。
@@ -39,7 +49,7 @@ func (s *Scheduler) RunBlackcatNow() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
 		if a.IsEnterpriseSession() {
-			continue // 企业版 / 企业切换会话门控：无成长体系（growth 403 / claim-gift 400「企业账号不支持该操作」；切换会话不计分）
+			continue // 真企业版门控：无成长体系（growth 403 / claim-gift 400「企业账号不支持该操作」）
 		}
 		need, err := s.cfg.Upstream.BlackcatNeed(a)
 		if err != nil {

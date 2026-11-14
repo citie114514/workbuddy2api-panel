@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"strings"
 	"testing"
+	"time"
 )
 
 // imagePartSig 计算 part 原文摘要（sha256 前 8 hex），供期望值精确构造——
@@ -59,6 +60,27 @@ func TestNewMessageIDFormat(t *testing.T) {
 				t.Fatalf("NewMessageID() = %q has non-hex char %q", id, ch)
 			}
 		}
+	}
+}
+
+func TestNewConversationIDShape(t *testing.T) {
+	seen := make(map[string]bool)
+	for i := 0; i < 100; i++ {
+		id := NewConversationID()
+		// 版本位 7（UUIDv7）、variant 8/9/a/b，带连字符。
+		// 抓官方内置 CLI 实测：X-Conversation-ID = 01a1a770-b339-7b06-80ab-574f992a9397
+		if len(id) != 36 || id[14] != '7' || !strings.ContainsRune("89ab", rune(id[19])) {
+			t.Fatalf("NewConversationID() = %q, want UUID v7 shape", id)
+		}
+		for _, pos := range []int{8, 13, 18, 23} {
+			if id[pos] != '-' {
+				t.Fatalf("NewConversationID() = %q, missing hyphen at %d", id, pos)
+			}
+		}
+		if seen[id] {
+			t.Fatalf("duplicate conversation ID: %q", id)
+		}
+		seen[id] = true
 	}
 }
 
@@ -142,6 +164,62 @@ func TestTurnRequestIDDerivation(t *testing.T) {
 	for _, id := range []string{a1, TurnRequestID(""), TurnRequestID("x")} {
 		if len(id) != 32 {
 			t.Errorf("TurnRequestID value %q len=%d want 32", id, len(id))
+		}
+	}
+}
+
+// TestDerivedIDsAreUUIDv7 会话头族的 ID 必须是 UUIDv7 形态。
+//
+// 依据：官方 CLI 内核里 assertClientConversationRequestId 明确断言
+// "conversationRequestId must be a lowercase UUIDv7 encoded as 32 hexadecimal
+// characters"，且依赖 uuidv7 包；抓包实测我们此前发的是 ver=8/9/a（sha256 派生的
+// 第 13 位随机），属于形态不一致。
+func TestDerivedIDsAreUUIDv7(t *testing.T) {
+	check := func(name, id string) {
+		t.Helper()
+		if len(id) != 32 {
+			t.Fatalf("%s: len=%d want 32 (%q)", name, len(id), id)
+		}
+		if id[12] != '7' {
+			t.Errorf("%s: version nibble=%q want '7' (%q)", name, id[12], id)
+		}
+		if v := id[16]; v != '8' && v != '9' && v != 'a' && v != 'b' {
+			t.Errorf("%s: variant nibble=%q want 8/9/a/b (%q)", name, v, id)
+		}
+	}
+	for i := 0; i < 32; i++ {
+		check("NewMessageID", NewMessageID())
+	}
+	check("RequestIDForKey", RequestIDForKey("session-abc"))
+	check("TurnRequestID", TurnRequestID("turn-abc"))
+}
+
+// TestDerivedIDsStayStable 打版本位不能破坏「同一会话同值」：缓存槽依赖这一点。
+func TestDerivedIDsStayStable(t *testing.T) {
+	if a, b := RequestIDForKey("k1"), RequestIDForKey("k1"); a != b {
+		t.Fatalf("RequestIDForKey 不稳定: %q vs %q", a, b)
+	}
+	if a, b := TurnRequestID("t1"), TurnRequestID("t1"); a != b {
+		t.Fatalf("TurnRequestID 不稳定: %q vs %q", a, b)
+	}
+	if RequestIDForKey("k1") == RequestIDForKey("k2") {
+		t.Fatal("不同键派生出同一个 ID")
+	}
+}
+
+// TestDerivedIDPseudoTimeInWindow 伪时间必须落在锚点窗口内（否则 ID 会像来自 1970 年）。
+func TestDerivedIDPseudoTimeInWindow(t *testing.T) {
+	for i := 0; i < 64; i++ {
+		id := NewMessageID()
+		raw, err := hex.DecodeString(id)
+		if err != nil || len(raw) != 16 {
+			t.Fatalf("ID 不是 32 位 hex: %q (%v)", id, err)
+		}
+		ms := int64(raw[0])<<40 | int64(raw[1])<<32 | int64(raw[2])<<24 |
+			int64(raw[3])<<16 | int64(raw[4])<<8 | int64(raw[5])
+		ts := time.UnixMilli(ms).UTC()
+		if ts.Before(v7Epoch) || !ts.Before(v7Epoch.Add(v7Window)) {
+			t.Fatalf("伪时间越界: %v（id=%q）", ts, id)
 		}
 	}
 }

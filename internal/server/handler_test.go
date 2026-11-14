@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -50,6 +51,25 @@ func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body 
 				StatusCode: status,
 				Header:     http.Header{"Content-Type": []string{ct}},
 				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+}
+
+type errorReader struct{ err error }
+
+func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
+
+func newReadFailureUpstream(prefix string) *upstream.Client {
+	return &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(io.MultiReader(strings.NewReader(prefix),
+					errorReader{errors.New("forced upstream read failure")})),
 			}, nil
 		})},
 		ChatBaseCN:    "https://fake.example",
@@ -167,11 +187,18 @@ func TestChatBadParamsFailsFastWithoutPenalty(t *testing.T) {
 	}
 }
 
-// TestChatQueueFullFailsFastWithoutPenalty 上游 429 + code 6021「queue.full.title」
-// 是渠道级容量满载（推理集群排队打满），**不是账号问题**（2026-10-15 实案：按
-// 限流逐号软冷却，2 秒绞杀整池健康号）。端到端断言：不轮转（只打一次上游）、
-// 直接回 503 + upstream_busy（可重试语义）、账号零惩罚（无冷却/无熔断/无连败）。
-func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
+// TestChatQueueFullStopsRotationOnFirstHit 上游 429 + code 6021
+// 「queue.full.title」是**按模型**的排队/满载（不是账号问题，也不是渠道级）：
+//   - 零惩罚不变：不冷却 / 不熔断 / 不喂连败（2026-10-15 实案：按限流逐号软冷却，
+//     2 秒绞杀整池健康号）；
+//   - **命中即终止轮转**，不回 503，按 429 + Retry-After 透传排队语义。
+//
+// 为什么不再换号：2026-11-02 10:43–10:48 的生产窗口里，同一批账号上
+// deepseek-v4.1-flash 139 条全部 200，而 glm-5.3 / kimi-k3.1-pro 的 14 条全部
+// 6020/6021、全部 attempts=3（三个不同号都撞墙）、耗时 3.4–5.1s。同一模型换号
+// 一次都救不回来，轮转只是把 ~1 秒的失败拖成 3.5 秒。本用例钉住「第二个号没有
+// 被调用」——这正是省下来的那两轮必然失败的上游请求。
+func TestChatQueueFullStopsRotationOnFirstHit(t *testing.T) {
 	calls := map[string]int{}
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls[authz]++
@@ -186,27 +213,189 @@ func TestChatQueueFullFailsFastWithoutPenalty(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("code=%d body=%s (want 503: channel-level busy, client should back off and retry)", rec.Code, rec.Body)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d body=%s (want 429：排队语义原样透传，客户端按 Retry-After 重试)", rec.Code, rec.Body)
 	}
-	if calls["Bearer at-busy1"] != 1 || calls["Bearer at-busy2"] != 0 {
-		t.Errorf("calls=%v want busy1 1 次、busy2 0 次（零轮转）", calls)
+	if calls["Bearer at-busy1"] != 1 {
+		t.Errorf("calls=%v want busy1 恰好 1 次", calls)
 	}
-	// 账号完好：无冷却、无熔断计数、无连败降权。
-	st, _ := p.Status("busy1")
-	if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
-		t.Errorf("ErrUpstreamBusy must not penalize account: %+v", st)
+	if calls["Bearer at-busy2"] != 0 {
+		t.Errorf("calls=%v want busy2 **0** 次（模型级排队换号无效，不得继续轮转）", calls)
 	}
-	// 响应体：上游原文透传（requestId 在场）+ upstream_busy code。
+	if ra := rec.Header().Get("Retry-After"); ra != "5" {
+		t.Errorf("Retry-After=%q want 5（上游未给 data.retry_after 时的本地兜底）", ra)
+	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "6021") || !strings.Contains(body, "queue.full.title") {
-		t.Errorf("503 message should carry upstream 6021 info: %s", body)
+	if !strings.Contains(body, "6021") || !strings.Contains(body, "queue.full.title") || !strings.Contains(body, "b1bc87ea") {
+		t.Errorf("429 body 应透传上游原文（code/msg/requestId）: %s", body)
 	}
 	if !strings.Contains(body, "upstream_busy") {
-		t.Errorf("503 body should carry upstream_busy code: %s", body)
+		t.Errorf("429 body 应带 upstream_busy code: %s", body)
 	}
 	if strings.Contains(body, "no_healthy_account") {
-		t.Errorf("channel-busy failure must not be reported as account exhaustion: %s", body)
+		t.Errorf("channel-busy 不得报成账号耗尽: %s", body)
+	}
+	// 账号完好：无冷却、无禁用、无熔断计数、无 errTotal。两个号都要查——
+	// 只查 busy1 会漏掉「轮转把 busy2 也惩罚了」这种偏差。
+	for _, uid := range []string{"busy1", "busy2"} {
+		st, _ := p.Status(uid)
+		if st.Cooling || st.Disabled || st.ErrTotal != 0 || st.BreakerFails != 0 {
+			t.Errorf("%s: ErrUpstreamBusy must not penalize account: %+v", uid, st)
+		}
+	}
+}
+
+func TestChatQueueBusyRetryAfterAndSticky(t *testing.T) {
+	cases := []struct {
+		name   string
+		header http.Header
+		body   string
+		want   string
+	}{
+		{"响应头优先于响应体", http.Header{"Retry-After": {"2"}}, `{"code":6020,"data":{"retry_after":7}}`, "2"},
+		{"响应体秒数向上取整", nil, `{"code":6021,"data":{"retry_after":2.25}}`, "3"},
+		{"缺省五秒", nil, `{"code":6020,"msg":"queue.waiting"}`, "5"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			up := &upstream.Client{
+				HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					calls++
+					header := http.Header{"Content-Type": {"application/json"}}
+					for key, values := range tc.header {
+						header[key] = values
+					}
+					return &http.Response{StatusCode: http.StatusTooManyRequests, Header: header,
+						Body: io.NopCloser(strings.NewReader(tc.body))}, nil
+				})},
+				ChatBaseCN: "https://fake.example", BillingBaseCN: "https://fake.example",
+			}
+			p := testPoolWith(&auth.Auth{UID: "busy", AccessToken: "at-busy", ExpiresAt: 9999999999})
+			store := newBindStore()
+			sess := session.New(session.Config{TTL: time.Minute, Store: store,
+				Available: func() []string { return []string{"busy"} }})
+			sess.Bind("conv-queue", "busy")
+			h := NewHandler(Config{Pool: p, Upstream: up, Session: sess})
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+				strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-queue"}}`)))
+			if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") != tc.want {
+				t.Fatalf("code=%d Retry-After=%q want %q body=%s", rec.Code, rec.Header().Get("Retry-After"), tc.want, rec.Body)
+			}
+			if calls != 1 {
+				t.Fatalf("calls=%d want 1（单号池轮换无可换号，末端直接透传）", calls)
+			}
+			if uid, ok := store.lastUID("conv-queue"); !ok || uid != "busy" {
+				t.Fatalf("channel capacity must preserve sticky binding: uid=%q ok=%v", uid, ok)
+			}
+			st, _ := p.Status("busy")
+			if st.Cooling || st.InFlight != 0 || st.ConsecutiveFails != 0 || st.BreakerFails != 0 {
+				t.Fatalf("channel capacity must not penalize or retain lease: %+v", st)
+			}
+		})
+	}
+}
+
+func TestChatModelBusyKeepsStickyAcrossTemporaryProxy(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(map[bool]string{false: "non-stream", true: "stream"}[stream], func(t *testing.T) {
+			calls := map[string]int{}
+			up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+				calls[authz]++
+				if authz == "Bearer at-bad" {
+					return http.StatusTooManyRequests, `{"code":14003,"msg":"model capacity busy"}`, false
+				}
+				return http.StatusOK, sseOK, true
+			})
+			p := testPoolWith(
+				&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+				&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+			)
+			p.SetCredits("bad", 2000, 0)
+			store := newBindStore()
+			sess := session.New(session.Config{TTL: time.Minute, Store: store,
+				Available: func() []string { return []string{"bad", "good"} }})
+			sess.Bind("conv-capacity", "bad")
+			h := NewHandler(Config{Pool: p, Upstream: up, Session: sess})
+			body := fmt.Sprintf(`{"model":"glm-5.2","stream":%t,"messages":[],"metadata":{"conversation_id":"conv-capacity"}}`, stream)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+			}
+			if calls["Bearer at-bad"] != 1 || calls["Bearer at-good"] != 1 {
+				t.Fatalf("calls=%v want one 14003 attempt then one temporary proxy", calls)
+			}
+			if uid, ok := store.lastUID("conv-capacity"); !ok || uid != "bad" {
+				t.Fatalf("temporary proxy must not steal sticky binding: uid=%q ok=%v", uid, ok)
+			}
+			bad, _ := p.Status("bad")
+			good, _ := p.Status("good")
+			if bad.Cooling || bad.Disabled || bad.InFlight != 0 || bad.ConsecutiveFails != 0 || bad.BreakerFails != 0 || bad.SuccessCount != 0 {
+				t.Fatalf("14003 must be model-only capacity without account penalty: %+v", bad)
+			}
+			if good.SuccessCount != 1 || good.InFlight != 0 {
+				t.Fatalf("temporary proxy success accounting incorrect: %+v", good)
+			}
+		})
+	}
+}
+
+func TestChatModelBusyAllCapacityReturnsRetryable429(t *testing.T) {
+	calls := 0
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{StatusCode: http.StatusTooManyRequests,
+				Header: http.Header{"Content-Type": {"application/json"}, "Retry-After-Ms": {"1500"}},
+				Body:   io.NopCloser(strings.NewReader(`{"code":14003,"msg":"model capacity busy"}`))}, nil
+		})},
+		ChatBaseCN: "https://fake.example", BillingBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "busy", AccessToken: "at-busy", ExpiresAt: 9999999999})
+	store := newBindStore()
+	sess := session.New(session.Config{TTL: time.Minute, Store: store,
+		Available: func() []string { return []string{"busy"} }})
+	sess.Bind("conv-capacity-terminal", "busy")
+	h := NewHandler(Config{Pool: p, Upstream: up, Session: sess})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-capacity-terminal"}}`)))
+	// 429 而非 503：14003 是「这一刻没容量」，按限流语义 + Retry-After 让 SDK 退避重试；
+	// 503 会被部分客户端当成服务端故障直接中断任务。
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") != "2" {
+		t.Fatalf("code=%d Retry-After=%q body=%s", rec.Code, rec.Header().Get("Retry-After"), rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "model_busy") || strings.Contains(rec.Body.String(), "model_unavailable") {
+		t.Fatalf("pure capacity must be model_busy, not model_unavailable: %s", rec.Body)
+	}
+	if calls != 1 {
+		t.Fatalf("single busy account must not be retried repeatedly in one request: calls=%d", calls)
+	}
+	if uid, ok := store.lastUID("conv-capacity-terminal"); !ok || uid != "busy" {
+		t.Fatalf("terminal capacity response must preserve binding: uid=%q ok=%v", uid, ok)
+	}
+}
+
+func TestChatMixedModelCooldownRemainsUnavailable(t *testing.T) {
+	p := testPoolWith(
+		&auth.Auth{UID: "capacity", AccessToken: "at-capacity", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "limited", AccessToken: "at-limited", ExpiresAt: 9999999999},
+	)
+	p.CooldownModelBusy("capacity", "glm-5.2", 0, "14003")
+	p.CooldownSoftForModel("limited", time.Minute, time.Now().Add(time.Hour), "glm-5.2", "6004")
+	h := NewHandler(Config{Pool: p, Upstream: newFakeUpstream(t, func(string) (int, string, bool) {
+		t.Fatal("fully model-cooled pool must not call upstream")
+		return 0, "", false
+	})})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "model_unavailable") {
+		t.Fatalf("mixed cooldown must retain conservative 400 model_unavailable: code=%d body=%s", rec.Code, rec.Body)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "" {
+		t.Fatalf("non-retryable mixed model block must not carry Retry-After: %q", got)
 	}
 }
 
@@ -624,8 +813,40 @@ func TestChatStickySuccessKeepsBinding(t *testing.T) {
 	}
 }
 
-// TestChatStickyFullFallsBackToRotation 端到端验证 C3 语义：粘性号满载不可用时，
-// 请求在同一轮内解绑并回落普通轮换选中健康账号，绑定收敛到最终成功号——而非空耗一轮。
+func TestChatUpstreamReadFailureDoesNotSucceedOrKeepSticky(t *testing.T) {
+	prefix := strings.Split(sseOK, "data: [DONE]")[0]
+	for _, stream := range []bool{true, false} {
+		t.Run(map[bool]string{true: "stream", false: "non-stream"}[stream], func(t *testing.T) {
+			st := newBindStore()
+			sess := session.New(session.Config{TTL: time.Minute, Store: st,
+				Available: func() []string { return []string{"u1"} }})
+			p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+			h := NewHandler(Config{Pool: p, Upstream: newReadFailureUpstream(prefix), Session: sess})
+			sess.Bind("conv-read", "u1")
+			body := fmt.Sprintf(`{"model":"glm-5.2","stream":%t,"messages":[],"metadata":{"conversation_id":"conv-read"}}`, stream)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
+			if stream {
+				if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "upstream stream interrupted") ||
+					!strings.Contains(rec.Body.String(), "data: [DONE]") {
+					t.Fatalf("stream response code=%d body=%s", rec.Code, rec.Body)
+				}
+			} else if rec.Code != http.StatusBadGateway || !strings.Contains(rec.Body.String(), "forced upstream read failure") {
+				t.Fatalf("non-stream response code=%d body=%s", rec.Code, rec.Body)
+			}
+			account, _ := p.Status("u1")
+			if account.SuccessCount != 0 {
+				t.Fatalf("interrupted upstream must not count as success: %+v", account)
+			}
+			if uid, ok := st.lastUID("conv-read"); ok {
+				t.Fatalf("failed account must release sticky binding, still bound to %s", uid)
+			}
+		})
+	}
+}
+
+// TestChatStickyFullFallsBackToRotation 粘性号满载时本次可溢出到健康账号，
+// 但绑定保留在原号；即使整池随后满载，也不能把临时压力变成永久搬号。
 func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 	st := newBindStore()
 	sess := session.New(session.Config{
@@ -637,7 +858,7 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
 	)
-	// bad 占满唯一在途名额：PickByUID 将返回 nil（healthy 但 inFlight 满）→ 解绑 + 回落轮换。
+	// bad 占满唯一在途名额：本次回落轮换，但不解绑。
 	p.SetMaxInFlight(1)
 	p.Acquire("bad")
 
@@ -657,11 +878,21 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	// 满载粘性号被解绑，绑定收敛到最终成功号 good。
-	if uid, ok := st.lastUID("conv-1"); !ok || uid != "good" {
-		t.Fatalf("sticky binding should fall back to good, got %s ok=%v (binds=%v)", uid, ok, st.binds)
+	if uid, ok := st.lastUID("conv-1"); !ok || uid != "bad" {
+		t.Fatalf("temporary overflow must keep original binding, got %s ok=%v (binds=%v)", uid, ok, st.binds)
+	}
+	// 整池满载时选不到任何号，绑定仍须保留。
+	p.Acquire("good")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[],"metadata":{"conversation_id":"conv-1"}}`)))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("all-full code=%d body=%s", rec.Code, rec.Body)
+	}
+	if uid, ok := st.lastUID("conv-1"); !ok || uid != "bad" {
+		t.Fatalf("all-full must not clear binding, got %s ok=%v", uid, ok)
 	}
 	p.Release("bad")
+	p.Release("good")
 }
 
 func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
@@ -794,7 +1025,7 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 
 // TestChat6004WithoutResetFallsBackToBackoff 6004 无时间文案 → 退回 600s 基数软冷却
 // （现状不变）。
-func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
+func TestChat6004WithoutResetUsesModelBackoff(t *testing.T) {
 	var calls int
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		calls++
@@ -817,15 +1048,18 @@ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	st, _ := p.Status("bad")
-	if !st.Cooling || st.CoolKind != "soft_rate" {
-		t.Fatalf("bad should be soft cooling: %+v", st)
-	}
-	// 冷却时长 = 注入 soft 基数(60s)，非解析时间（无重置文案）。
-	if st.CoolRemaining <= 0 || st.CoolRemaining > 60 {
-		t.Errorf("cool_remaining_sec=%d want ~60 (soft base, not parsed)", st.CoolRemaining)
+	if st.Cooling {
+		t.Fatalf("6004 without reset must not cool the whole account: %+v", st)
 	}
 	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "glm-5.3" || st.RateLimitedModels[0].Kind != "rate_limit" {
-		t.Fatalf("rate-limited models=%+v, want audit row for glm-5.3", st.RateLimitedModels)
+		t.Fatalf("rate-limited models=%+v, want model row for glm-5.3", st.RateLimitedModels)
+	}
+	until := st.RateLimitedModels[0].Until
+	if rem := time.Until(until); rem <= 0 || rem > time.Minute {
+		t.Errorf("model cooldown remaining=%v want ~60s", rem)
+	}
+	if got := p.PickExcludingForModel(nil, "hy3-x"); got == nil || got.UID != "bad" {
+		t.Fatalf("other model should still select bad, got %+v", got)
 	}
 }
 
@@ -971,6 +1205,13 @@ func TestChatModelForbiddenByAccountTypeReturns400(t *testing.T) {
 }
 
 func TestModelsEndpoint(t *testing.T) {
+	// 动态目录缓存是包级状态；随机顺序执行时不能继承其他用例的失败退避。
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = nil
+	dynamicModelsCache.fetched = time.Time{}
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.Unlock()
+
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
 	req := httptest.NewRequest("GET", "/v1/models", nil)
 	rec := httptest.NewRecorder()
@@ -1482,7 +1723,7 @@ func TestContentBlockedTriggersDegradedRetry(t *testing.T) {
 	var bodies [][]byte
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			raw, _ := io.ReadAll(r.Body)
+			raw := readUpstreamBody(r)
 			bodies = append(bodies, raw)
 			// 首次（body 含原始 system）返回 400 内容拦截；后续返回 200。
 			if len(bodies) == 1 {
@@ -1618,13 +1859,20 @@ func TestContentBlockedDoesNotPenalizeAccount(t *testing.T) {
 // 两层各自职责（互不替代）：
 //   - prompt.Rewrite 替换 system/developer 消息（消灭 system 来源指纹）；
 //   - sanitizeMessages 改写 user/assistant 消息中残留的指纹串（兜底用户上下文）。
-func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
-	// 捕获出站 body（prepareBody 已强制 stream + 归一 + 清洗后）。
+//
+// TestCustomModeFingerprintSanitizePerRole custom 端到端：system 被替换成自有提示词；
+// sanitize 只洗**身份域**消息（system / developer / assistant）。user 里的同一句属
+// 用户数据，必须逐字保留（P4：作用域收窄到身份域）；assistant 必须被改写（证明清洗
+// 层仍在工作，不是「全删了」）。
+func TestCustomModeFingerprintSanitizePerRole(t *testing.T) {
+	const ccIdent = "You are Claude Code, Anthropic's official CLI for Claude."
+	const ccBranch = "Main branch (you will usually use this for PRs)"
+	const customSys = "网关自有提示词"
+
 	var sentBody []byte
 	up := &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			raw, _ := io.ReadAll(r.Body)
-			sentBody = raw
+			sentBody = readUpstreamBody(r)
 			return &http.Response{
 				StatusCode: 200,
 				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
@@ -1635,66 +1883,53 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 	}
 	up.SanitizeFingerprints.Store(true) // 开启清洗层（与生产一致）
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
-	const customSys = "我是网关自有提示词"
 	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "custom", PromptText: customSys})
 
-	// user 消息含 Claude Code 指纹句（PR39 的 fixture 串，逐字精确指纹）。
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
-		"model":"glm-5.2",
-		"stream":true,
-		"messages":[
-			{"role":"system","content":"You are Claude Code, Anthropic's official CLI for Claude."},
-			{"role":"user","content":"You are Claude Code, Anthropic's official CLI for Claude. Main branch (you will usually use this for PRs)"}
-		]
-	}`))
+	userContent := ccIdent + " " + ccBranch
+	body := `{"model":"glm-5.2","stream":true,"messages":[` +
+		`{"role":"system","content":"` + ccIdent + `"},` +
+		`{"role":"user","content":"` + userContent + `"},` +
+		`{"role":"assistant","content":"` + ccIdent + `"}]}`
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body)))
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
 	out := string(sentBody)
-	// 1) system 为自有提示词，旧 system 内容零残留。
 	if !strings.Contains(out, customSys) {
 		t.Errorf("out body should contain custom system prompt: %s", out)
 	}
-	if strings.Contains(out, "official CLI for Claude.") && strings.Contains(out, "You are Claude Code, Anthropic's") {
-		// 旧 system 原文（含句点）不应以 system 角色出现；但 sanitize 把它改写为
-		// "...official CLI tool for Claude."，所以原文 fingerprint 串应消失。
-	}
-	// 原始指纹串（逐字精确匹配）在出站 body 中应被改写：
-	// "official CLI for Claude." → "official CLI tool for Claude."
-	// "Main branch (" → "Default branch ("
-	if strings.Contains(out, "official CLI for Claude.") {
-		t.Errorf("identity fingerprint not rewritten by sanitize in user msg: %s", out)
-	}
-	if strings.Contains(out, "Main branch (you will usually use this for PRs)") {
-		t.Errorf("branch fingerprint not rewritten by sanitize in user msg: %s", out)
-	}
-	// 改写后的痕迹应在（证明 sanitize 层生效，不是"全删了"）。
-	if !strings.Contains(out, "official CLI tool for Claude.") {
-		t.Errorf("sanitized identity rewrite missing: %s", out)
-	}
-	if !strings.Contains(out, "Default branch (you will usually use this for PRs)") {
-		t.Errorf("sanitized branch rewrite missing: %s", out)
-	}
-	// 2) messages 头部恰好一条 system = 自有提示词（Rewrite 已删旧 system）。
 	var obj map[string]any
 	if err := json.Unmarshal(sentBody, &obj); err != nil {
 		t.Fatalf("out body not json: %v %s", err, out)
 	}
-	msgs := obj["messages"].([]any)
+	msgs, _ := obj["messages"].([]any)
+	var gotSystem, gotUser, gotAssistant string
 	var systemCount int
 	for _, m := range msgs {
-		mm := m.(map[string]any)
-		if mm["role"] == "system" {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		c, _ := mm["content"].(string)
+		switch mm["role"] {
+		case "system":
 			systemCount++
-			if mm["content"] != customSys {
-				t.Errorf("system content=%v want %q", mm["content"], customSys)
-			}
+			gotSystem = c
+		case "user":
+			gotUser = c
+		case "assistant":
+			gotAssistant = c
 		}
 	}
-	if systemCount != 1 {
-		t.Errorf("want exactly 1 system message, got %d (all=%v)", systemCount, msgs)
+	if systemCount != 1 || gotSystem != customSys {
+		t.Errorf("want exactly 1 system = %q, got count=%d content=%q", customSys, systemCount, gotSystem)
+	}
+	if gotUser != userContent {
+		t.Errorf("user data must stay verbatim (identity scope narrowed): got %q want %q", gotUser, userContent)
+	}
+	if gotAssistant == ccIdent {
+		t.Errorf("assistant identity sentence should be sanitized, got unchanged: %q", gotAssistant)
 	}
 }
 
@@ -2052,5 +2287,231 @@ func TestModelsHiddenFiltered(t *testing.T) {
 	}
 	if ids["cn:deepseek-v3"] {
 		t.Errorf("hidden model leaked into /v1/models: ids=%v", ids)
+	}
+}
+
+// TestNonStreamEmptyReplyRescue 非流式：思考吃光 max_tokens（finish_reason=length、
+// 正文零字节、无 tool_calls）时，同额度关思考重发一次，客户端拿到正常正文。
+//
+// 这是 Agent 循环最怕的形态：回合"正常结束"却一个字都没有，比报错更难排查。
+func TestNonStreamEmptyReplyRescue(t *testing.T) {
+	const emptyTruncated = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4.1-flash\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4.1-flash\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	const rescued = "data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4.1-flash\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"来自救援流\"}}]}\n\n" +
+		"data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4.1-flash\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3,\"total_tokens\":8}}\n\n" +
+		"data: [DONE]\n\n"
+
+	var bodies []string
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw := readUpstreamBody(r)
+			bodies = append(bodies, string(raw))
+			body := emptyTruncated
+			if len(bodies) > 1 {
+				body = rescued
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
+		"model":"deepseek-v4.1-flash",
+		"max_tokens":200,
+		"messages":[{"role":"user","content":"hi"}]
+	}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("上游调用次数=%d want 2（首跳 + 救援跳）", len(bodies))
+	}
+	if !strings.Contains(rec.Body.String(), "来自救援流") {
+		t.Fatalf("客户端应拿到救援流的正文: %s", rec.Body)
+	}
+	// 救援请求必须关思考，且不放大客户端给的 max_tokens。
+	var second map[string]any
+	if err := json.Unmarshal([]byte(bodies[1]), &second); err != nil {
+		t.Fatalf("救援请求体非法: %v", err)
+	}
+	th, _ := second["thinking"].(map[string]any)
+	if th["type"] != "disabled" {
+		t.Fatalf("救援请求 thinking=%v want disabled", second["thinking"])
+	}
+	if mt, _ := second["max_tokens"].(float64); mt != 200 {
+		t.Fatalf("救援请求 max_tokens=%v want 200（不得放大）", second["max_tokens"])
+	}
+}
+
+// TestStreamEmptyReplyRescue 流式同一形态：换掉空流而不是把空回复透给客户端。
+// 客户端不应看到第一跳的 finish_reason=length，也不应看到两个 [DONE]。
+func TestStreamEmptyReplyRescue(t *testing.T) {
+	const emptyTruncated = "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4.1-flash\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"}}]}\n\n" +
+		"data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4.1-flash\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	const rescued = "data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4.1-flash\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"流式救援\"}}]}\n\n" +
+		"data: {\"id\":\"c2\",\"object\":\"chat.completion.chunk\",\"model\":\"deepseek-v4.1-flash\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	var bodies []string
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			raw := readUpstreamBody(r)
+			bodies = append(bodies, string(raw))
+			body := emptyTruncated
+			if len(bodies) > 1 {
+				body = rescued
+			}
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
+		"model":"deepseek-v4.1-flash",
+		"stream":true,
+		"max_tokens":200,
+		"messages":[{"role":"user","content":"hi"}]
+	}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("上游调用次数=%d want 2（首跳 + 救援跳）", len(bodies))
+	}
+	out := rec.Body.String()
+	if !strings.Contains(out, "流式救援") {
+		t.Fatalf("客户端应拿到救援流正文: %q", out)
+	}
+	if strings.Contains(out, `"length"`) {
+		t.Fatalf("空回复的 finish_reason=length 不应透出: %q", out)
+	}
+	if n := strings.Count(out, "[DONE]"); n != 1 {
+		t.Fatalf("[DONE] 次数=%d want 1: %q", n, out)
+	}
+	var second map[string]any
+	if err := json.Unmarshal([]byte(bodies[1]), &second); err != nil {
+		t.Fatalf("救援请求体非法: %v", err)
+	}
+	th, _ := second["thinking"].(map[string]any)
+	if th["type"] != "disabled" {
+		t.Fatalf("救援请求 thinking=%v want disabled", second["thinking"])
+	}
+}
+
+// TestModelHangCircuitRejectsAtEntry 模型级挂死熔断：连续停滞达阈值后，入口直接
+// 503 + Retry-After，不再逐号白等一整个超时（上游调用次数必须为 0）。
+func TestModelHangCircuitRejectsAtEntry(t *testing.T) {
+	var calls int
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader(sseOK))}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.NoteModelHang("cn", "glm-5.2")
+	p.NoteModelHang("cn", "glm-5.2") // 第 2 次 → 熔断
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
+		"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d want 503, body=%s", rec.Code, rec.Body)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra == "" {
+		t.Fatal("熔断应带 Retry-After")
+	}
+	if calls != 0 {
+		t.Fatalf("熔断期不应打上游，calls=%d", calls)
+	}
+	if !strings.Contains(rec.Body.String(), "model_temporarily_down") {
+		t.Fatalf("错误码应为 model_temporarily_down: %s", rec.Body)
+	}
+}
+
+// TestModelQuotaLockReturns429 全池清一色 6004 配额锁：429 + 明确 code，
+// 且**不带** Retry-After（带上会让部分客户端把整段冷却当成静默等待）。
+func TestModelQuotaLockReturns429(t *testing.T) {
+	var calls int
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader(sseOK))}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.CooldownSoftForModel("u1", time.Hour, time.Now().Add(time.Hour), "glm-5.2", "6004 model rate limit")
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
+		"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("code=%d want 429, body=%s", rec.Code, rec.Body)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra != "" {
+		t.Fatalf("配额锁不得带 Retry-After，got %q", ra)
+	}
+	if !strings.Contains(rec.Body.String(), "model_quota_exhausted") {
+		t.Fatalf("错误码应为 model_quota_exhausted: %s", rec.Body)
+	}
+	if calls != 0 {
+		t.Fatalf("全池锁定时不应打上游，calls=%d", calls)
+	}
+}
+
+// TestModelUnavailableStill400 混合原因（11102 确定性不可用）仍按 400 不可重试处理，
+// 不能被配额分支误报成 429。
+func TestModelUnavailableStill400(t *testing.T) {
+	up := &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body: io.NopCloser(strings.NewReader(sseOK))}, nil
+		})},
+		ChatBaseCN: "https://fake.example",
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.BlockModelBackoff("u1", "glm-5.2", "11102 model not available")
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{
+		"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d want 400, body=%s", rec.Code, rec.Body)
+	}
+	if !strings.Contains(rec.Body.String(), "model_unavailable") {
+		t.Fatalf("错误码应为 model_unavailable: %s", rec.Body)
 	}
 }

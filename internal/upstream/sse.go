@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,9 +26,120 @@ var errEmptyStream = errors.New("upstream stream contained no valid data events"
 // upstream_parse 同语义），与客户端断连类错误区分。
 func IsEmptyStreamError(err error) bool { return errors.Is(err, errEmptyStream) }
 
+// FirstFrameRejected 上游首个帧就是失败帧，且此刻尚未向客户端写出任何字节。
+//
+// 为什么单独成一个类型：这是**唯一还能换号重试的时机**。一旦写出第一字节，HTTP
+// 响应头就已提交，本可换号解决的失败只能以 200 + error 帧透给客户端（头退不回来）。
+// 上游实测形态：`{code:11140,msg:"request illegal"}`（账号被限）、`{code:6021,
+// msg:"queue.full.title"}`（渠道队列满）都会以 HTTP 200 的 SSE 首帧出现。
+//
+// Kind 已按 Classify 归好类，上层接 applyErrorPolicy 即可；它是否值得换号由
+// firstFrameRejectable 把关（换号也没用的类别继续走透传，不放大无效请求）。
+type FirstFrameRejected struct {
+	Kind ErrKind
+	Body string
+}
+
+func (e *FirstFrameRejected) Error() string {
+	msg := e.Body
+	if len(msg) > 120 {
+		msg = msg[:120] + "…"
+	}
+	return fmt.Sprintf("upstream first frame rejected (%s): %s", e.Kind, msg)
+}
+
+// firstFrameRejectable 首帧否决只对「换个账号可能就是好的」类别生效。
+//
+// 排除项都是换号必然重撞同一堵墙的：6021 渠道队列满（ErrUpstreamBusy）、请求体
+// 畸形（ErrBadParams）、上下文超限（ErrPromptTooLong）、图片无效（ErrImageInvalid）、
+// 工具序列损坏（ErrToolSequence）。对它们否决只会把无效请求放大 N 倍打上游，
+// 还不如按原逻辑把上游原文透传给客户端。
+func firstFrameRejectable(k ErrKind) bool {
+	switch k {
+	case ErrSoftRate, ErrAccountFault, ErrHardCredit, ErrServer, ErrModelBlocked, ErrSessionDead:
+		return true
+	}
+	return false
+}
+
+// clearStreamHeaders 撤销 StreamHint 开头设过的 SSE 响应头。
+// 首帧否决后这次请求不会以流式返回：header 里留着 text/event-stream 会让换号后
+// 的成功响应、或最终兜底的 JSON 错误带上错 Content-Type。
+func clearStreamHeaders(h http.Header) {
+	h.Del("Content-Type")
+	h.Del("Cache-Control")
+	h.Del("Connection")
+	h.Del("X-Accel-Buffering")
+}
+
+// streamReadError 标记上游响应体的读失败，与写给客户端时的写失败区分。
+type streamReadError struct{ err error }
+
+func (e *streamReadError) Error() string { return "upstream stream read: " + e.err.Error() }
+func (e *streamReadError) Unwrap() error { return e.err }
+
+// IsStreamReadError 报告流是否在上游读取侧中断。客户端写失败不属于此类。
+func IsStreamReadError(err error) bool {
+	var readErr *streamReadError
+	return errors.As(err, &readErr)
+}
+
 // Aggregate 读取完整 SSE 流，聚合 delta.content 为单个 OpenAI chat.completion 响应。
 // 分片/半行由 bufio.Reader.ReadString 处理；遇到 "data: [DONE]" 结束。
 // tool_calls 以流式 delta 到达（按 index 合并：首片带 id/type/name，后续只带 arguments 片段）。
+// decodeDataPayload 解析一个 data 行的载荷，返回其中所有可解析的事件对象。
+//
+// 正常形态是一行一个 JSON，走快路径（一次 Unmarshal，不新增分配）。上游偶尔把多个
+// 事件塞进同一行，两种表现都见过：重复的 "data: " 前缀，或两个 JSON 直接相邻。
+// 此前整行 Unmarshal 失败即静默丢弃，客户端看到的是缺段的回答；这里只在快路径失败
+// 时才切分重试，正常流量的开销为零。
+func decodeDataPayload(payload string) []map[string]any {
+	var one map[string]any
+	if json.Unmarshal([]byte(payload), &one) == nil {
+		return []map[string]any{one}
+	}
+	segs := []string{payload}
+	if strings.Contains(payload, "data:") {
+		segs = splitDataPrefix(payload)
+	}
+	var out []map[string]any
+	for _, seg := range segs {
+		seg = strings.TrimSpace(seg)
+		if seg == "" || seg == "[DONE]" {
+			continue
+		}
+		// 用流式解码器吃掉一段里连续出现的多个 JSON（{...}{...}）。
+		dec := json.NewDecoder(strings.NewReader(seg))
+		for {
+			var obj map[string]any
+			if err := dec.Decode(&obj); err != nil {
+				break
+			}
+			out = append(out, obj)
+		}
+	}
+	return out
+}
+
+// splitDataPrefix 把一行里重复出现的 "data:" 前缀切开，返回各段载荷。
+// 前缀后可能有一个空格，也可能没有。
+func splitDataPrefix(s string) []string {
+	var out []string
+	for {
+		i := strings.Index(s, "data:")
+		if i < 0 {
+			if strings.TrimSpace(s) != "" {
+				out = append(out, s)
+			}
+			return out
+		}
+		if i > 0 {
+			out = append(out, s[:i])
+		}
+		s = strings.TrimPrefix(s[i+len("data:"):], " ")
+	}
+}
+
 func Aggregate(r io.Reader) (map[string]any, error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var (
@@ -152,9 +265,11 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 				sawDone = true
 				break
 			} else {
-				var chunk map[string]any
-				if json.Unmarshal([]byte(payload), &chunk) == nil {
-					// 有效事件计数：仅 JSON 解析成功的数据帧计入（解析失败沿用静默 continue）。
+				// 一个 data 行可能塞了多个事件（重复 data: 前缀，或两个 JSON 直接相邻）。
+				// 逐条取出：某一条畸形只丢那一条，不再因为整行 Unmarshal 失败而吞掉同行的
+				// 正文——那会让客户端拿到缺段的回答，且日志里只看到「空流」。
+				for _, chunk := range decodeDataPayload(payload) {
+					// 有效事件计数：仅解析成功的事件计入（畸形片段不计）。
 					validEvents++
 					if v, ok := chunk["id"].(string); ok && id == "" {
 						id = v
@@ -485,6 +600,30 @@ type StreamOption func(*streamOptions)
 type streamOptions struct {
 	onErrorFrame func(payload string)
 	markup       *MarkupRepair
+	pingEvery    time.Duration
+	rescue       func() (io.Reader, func(), error)
+}
+
+// DefaultStreamPingInterval 静默多久写一个保活注释帧。
+//
+// 取 1 秒的依据是客户端的耐心，不是服务端的偏好：线上被标记为 interrupted 的
+// 请求里，绝大多数「总耗时」与「首字节耗时」几乎相等（1264/1265、1114/1115、
+// 1410/1410…），说明客户端在首字节到达前就断开了。也就是说等待窗口只有 1 秒
+// 量级，间隔再长就等于从未发出过。
+//
+// 两处保活共用这一个值，保持「客户端任意时刻最多 1 秒收不到字节」的单一语义：
+//   - handler 层（server.streamKeepAlive）：覆盖建连 + 选中账号 + 上游排队/预填，
+//     也就是拿到响应头之前的整段空窗；
+//   - 流内（本文件的 StreamHint）：覆盖「已开流、首内容帧未到」，例如上游先发
+//     role 帧、随后长时间思考。
+//
+// 注释帧是 SSE 规范里的 no-op，客户端不会解析成内容；空回复救援按正文层判断，
+// 同样不受影响。
+const DefaultStreamPingInterval = time.Second
+
+// WithPingInterval 覆盖静默保活间隔（<=0 使用 DefaultStreamPingInterval）。
+func WithPingInterval(d time.Duration) StreamOption {
+	return func(o *streamOptions) { o.pingEvery = d }
 }
 
 // WithMarkupRepair 注册「模型原生工具调用标记」修复器（见 dsml.go）。
@@ -496,6 +635,18 @@ type streamOptions struct {
 // 传 nil、或传入未启用的修复器（客户端没声明过 tools）→ 与 Stream 行为逐字节一致。
 func WithMarkupRepair(r *MarkupRepair) StreamOption {
 	return func(o *streamOptions) { o.markup = r }
+}
+
+// WithEmptyReplyRescue 注册「空回复救援」：整条流没有正文、没有工具调用，且上游以
+// finish_reason=length 收尾时（思考吃光 max_tokens 的实测形态：thinking token 数正好
+// 等于预算、正文零字节），调用 fn 取一条新的上游流替换掉这条空流。fn 返回的清理函数
+// 在函数退出前调用，可为 nil；返回 (nil, _, nil) 表示放弃救援，行为与未接线一致。
+//
+// 为什么由网关做：客户端给的是偏小的 max_tokens，上游把 reasoning 与正文算在同一份
+// 预算里，思考可以独吞全部额度。Agent 循环拿到 finish_reason=length + 零字节正文
+// 会当成"回合正常结束但什么都没说"，比报错更难排查。
+func WithEmptyReplyRescue(fn func() (io.Reader, func(), error)) StreamOption {
+	return func(o *streamOptions) { o.rescue = fn }
 }
 
 // WithErrorFrameObserver 注册"上游以 error 帧报错"的观察者：透传该帧之前先用
@@ -525,6 +676,108 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	h.Set("X-Accel-Buffering", "no")
 	fl, _ := w.(http.Flusher)
 
+	// 所有响应体写入共用一把锁：保活 goroutine 与主循环不得并发写 ResponseWriter。
+	var (
+		writeMu   sync.Mutex
+		lastWrite atomic.Int64
+	)
+	lastWrite.Store(time.Now().UnixNano())
+	writeOut := func(s string) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		if _, werr := io.WriteString(w, s); werr != nil {
+			return werr
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+		lastWrite.Store(time.Now().UnixNano())
+		return nil
+	}
+
+	// 空回复救援的预写缓冲。
+	//
+	// 上游把 reasoning 与正文字节算在同一个 max_tokens 里，思考可以独吞整份预算，
+	// 结果是 finish_reason=length、正文零字节、没有 tool_calls。此时客户端已经收到
+	// 的只有 role/finish 这类**没有信息量**的元数据帧，而流一旦写出去就无法回退。
+	//
+	// 做法：正文（或工具调用、错误帧）出现之前，帧先攒在 pending 里不发给客户端；
+	// 一旦出现正文/工具调用/错误，立即按原序补发并转入直通（committed）。整条流
+	// 始终没有正文且以 length 收尾时，攒下的元数据帧直接丢弃，改用关闭思考的重发流
+	// ——客户端只会看到一份正常回复，既没有空回复也没有重复的 finish 帧。
+	//
+	// 延迟影响为零：缓冲区里只可能是首内容帧之前的元数据帧，客户端对它们没有可
+	// 执行动作；保活 ping 走 writeOut 直写，不受缓冲影响。
+	var (
+		pending      []string
+		committed    bool
+		contentSeen  bool
+		sawToolCalls bool
+		finishReason string
+	)
+	flushPending := func() error {
+		if committed {
+			return nil
+		}
+		committed = true
+		for _, p := range pending {
+			if werr := writeOut(p); werr != nil {
+				return werr
+			}
+		}
+		pending = nil
+		return nil
+	}
+	// emit 写出一帧；commit=false 且尚未落定时先进缓冲。
+	emit := func(s string, commit bool) error {
+		if committed {
+			return writeOut(s)
+		}
+		if !commit {
+			pending = append(pending, s)
+			return nil
+		}
+		if werr := flushPending(); werr != nil {
+			return werr
+		}
+		return writeOut(s)
+	}
+	pingEvery := o.pingEvery
+	if pingEvery <= 0 {
+		pingEvery = DefaultStreamPingInterval
+	}
+	stopPing := make(chan struct{})
+	var pingWG sync.WaitGroup
+	pingWG.Add(1)
+	go func() {
+		defer pingWG.Done()
+		// 每半个间隔检查一次，使保活最迟在空闲达到 1.5 个间隔时发出。
+		checkEvery := pingEvery / 2
+		if checkEvery <= 0 {
+			checkEvery = time.Nanosecond
+		}
+		t := time.NewTicker(checkEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-stopPing:
+				return
+			case <-t.C:
+				if time.Since(time.Unix(0, lastWrite.Load())) < pingEvery {
+					continue
+				}
+				if err := writeOut(": ping\n\n"); err != nil {
+					// 客户端已走：主循环下一次写会拿到同一个错误，这里直接退出。
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(stopPing)
+		pingWG.Wait()
+	}()
+
 	// toolCallSeen 跨帧记录 delta.tool_calls 里已发过首片的 index，
 	// 供逐 chunk 透传时收敛 name 为「每 index 一次」（对齐 OpenAI 官方流）。
 	toolCallSeen := map[int]bool{}
@@ -544,15 +797,15 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	maxToolIdx := -1
 	toolFinishSent := false
 
-	// writeSSE 原样写出一帧并 flush。
+	// writeSSE 原样写出一帧并 flush（正文/元数据帧：是否需要落定由调用方决定，
+	// 未落定时先进空回复救援的预写缓冲）。
 	writeSSE := func(payload string) error {
-		if _, werr := io.WriteString(w, "data: "+payload+"\n\n"); werr != nil {
-			return werr
-		}
-		if fl != nil {
-			fl.Flush()
-		}
-		return nil
+		return emit("data: "+payload+"\n\n", contentSeen)
+	}
+
+	// writeSSECommit 写出一帧并强制落定（错误帧、非 JSON 帧等不得被缓冲的帧）。
+	writeSSECommit := func(payload string) error {
+		return emit("data: "+payload+"\n\n", true)
 	}
 
 	// writeRaw 原样写出一帧（绕过 normalizeFrame）。上游 error 帧（error-passthrough）
@@ -564,7 +817,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		if hint := frameGatewayHint(hintFn, payload); hint != "" {
 			payload = attachHintToErrorFrame(payload, hint)
 		}
-		return writeSSE(payload)
+		return writeSSECommit(payload)
 	}
 
 	// writeChunk 把一个 chunk 对象按规范白名单重建后写出并 flush，同时维护三件跨帧
@@ -607,7 +860,7 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		}
 		raw, err := json.Marshal(normalizeFrame(obj))
 		if err != nil {
-			return writeSSE(fallback)
+			return writeSSECommit(fallback)
 		}
 		return writeSSE(string(raw))
 	}
@@ -679,17 +932,52 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 	writeFrame := func(payload string) (int, error) {
 		var obj map[string]any
 		if json.Unmarshal([]byte(payload), &obj) != nil {
-			// 非 JSON 帧：原样降级写出，不计数（与修复前一致）。
-			if werr := writeSSE(payload); werr != nil {
+			// 非 JSON 帧：原样降级写出，不计数（与修复前一致）。形态不可辨识，
+			// 按"已落定"处理，不参与空回复救援（宁可放弃救援也不误吞客户端该看到的东西）。
+			if werr := writeSSECommit(payload); werr != nil {
 				return 0, werr
 			}
 			return 0, nil
 		}
-		// 上游错误帧透传（error-passthrough）：带 error 键的帧**原样写出**，不走
-		// normalizeFrame 白名单——白名单会剥掉 error 字段，客户端就看不到上游
-		// code/msg/requestId。error.message 即上游原文（如 6004 限流、审核拦截），
-		// 计入有效帧（避免误判空流补写 "empty upstream stream"）。
-		if _, hasErr := obj["error"]; hasErr {
+		// 空回复救援的判定输入（只看帧结构，不改写字节）：
+		//   - 正文/工具调用一旦出现 → contentSeen 落定，此后全部直通；
+		//   - finish_reason 记下来，收尾时判是否 length（预算被截断）。
+		if frameHasPayload(obj) {
+			contentSeen = true
+		}
+		if !sawToolCalls && frameHasToolCalls(obj) {
+			sawToolCalls = true
+			contentSeen = true
+		}
+		if fr := firstFinishReason(obj); fr != "" {
+			finishReason = fr
+		}
+		// 失败帧有两个形状：带 error 键的，以及顶层 {code,msg}（无 error 无 choices，
+		// 11140 request illegal / 6021 queue.full 的实测形态）。两者必须走同一路
+		// 首帧否决判据——只认 error 键会漏掉后者，让本可换号的失败被当成正常帧透传。
+		//
+		// 首帧否决：还没写过任何字节时，失败帧不该透传——这是唯一还能换号的时机
+		// （写出第一字节即提交响应头，之后只能 200+error 帧透给客户端）。是否值得
+		// 换号由 firstFrameRejectable 把关：6021 队列满 / 请求体畸形这类换号也没用的
+		// 类别继续走下面的透传，避免把无效请求放大 N 倍打上游。
+		_, hasErr := obj["error"]
+		if hasErr || isBareErrorFrame(obj) {
+			if !committed && !contentSeen && !sawToolCalls {
+				if k := Classify(http.StatusOK, payload); k != ErrNone && firstFrameRejectable(k) {
+					// 观测不因否决而断：账号处置虽然交给上层接手，但观察者（请求日志、
+					// 测试探针）拿到的失败帧原文必须与透传路径一致，否则这类失败会
+					// 在观测面上凭空消失。
+					if o.onErrorFrame != nil {
+						o.onErrorFrame(payload)
+					}
+					clearStreamHeaders(h)
+					return 0, &FirstFrameRejected{Kind: k, Body: payload}
+				}
+			}
+			// 上游错误帧透传（error-passthrough）：带 error 键的帧**原样写出**，不走
+			// normalizeFrame 白名单——白名单会剥掉 error 字段，客户端就看不到上游
+			// code/msg/requestId。error.message 即上游原文（如 6004 限流、审核拦截），
+			// 计入有效帧（避免误判空流补写 "empty upstream stream"）。
 			// 旁路通知（账号处置用）：原始 payload 交给观察者，透传字节不变。
 			if o.onErrorFrame != nil {
 				o.onErrorFrame(payload)
@@ -707,38 +995,81 @@ func StreamHint(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 		return 1, nil
 	}
 
-	br := bufio.NewReaderSize(r, 64*1024)
-	validFrames := 0
-readLoop:
-	for {
-		line, err := br.ReadString('\n')
-		trimmed := strings.TrimRight(line, "\r\n")
-		switch {
-		case strings.HasPrefix(trimmed, "data: [DONE]"):
-			// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
-			// [DONE] 统一在循环结束后写出，保证恰好一个。
-			break readLoop
-		case strings.HasPrefix(trimmed, "data: "):
-			n, werr := writeFrame(strings.TrimPrefix(trimmed, "data: "))
-			validFrames += n
-			if werr != nil {
-				return werr
+	// pump 读完一条上游流并转发所有帧，返回有效帧数与读错误。
+	// [DONE] 不在此写出——统一在函数末尾写，保证救援换流后仍恰好一个。
+	pump := func(rd io.Reader) (int, error) {
+		br := bufio.NewReaderSize(rd, 64*1024)
+		frames := 0
+	readLoop:
+		for {
+			line, err := br.ReadString('\n')
+			trimmed := strings.TrimRight(line, "\r\n")
+			switch {
+			case strings.HasPrefix(trimmed, "data: [DONE]"):
+				// 上游显式结束：停止读取，DONE 之后的任何数据（含垃圾帧）一律不再透传。
+				// [DONE] 统一在循环结束后写出，保证恰好一个。
+				break readLoop
+			case strings.HasPrefix(trimmed, "data: "):
+				n, werr := writeFrame(strings.TrimPrefix(trimmed, "data: "))
+				frames += n
+				if werr != nil {
+					return frames, werr
+				}
+			case trimmed != "":
+				// 注释帧原样透传并补足帧尾空行；下游 Messages/Responses 包装层
+				// 按空行分帧，缺少第二个换行会把注释与后续 data 错拼成一帧。
+				if strings.HasPrefix(trimmed, ":") {
+					line += "\n"
+				}
+				if werr := writeOut(line); werr != nil {
+					return frames, werr
+				}
 			}
-		case trimmed != "":
-			// 注释/其他行：原样透传
-			if _, werr := io.WriteString(w, line); werr != nil {
-				return werr
-			}
-			if fl != nil {
-				fl.Flush()
+			// 空行（帧分隔）吞掉：本函数自产 "\n\n"
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				// HTTP 头已发出，补明确的错误终态；仍返回读错误供账号与日志处置。
+				// 走 commit 路径：错误终态绝不能留在预写缓冲里被救援逻辑丢弃。
+				_ = writeSSECommit(`{"error":{"message":"upstream stream interrupted","type":"upstream_error","code":"upstream_parse"}}`)
+				_ = writeOut("data: [DONE]\n\n")
+				return frames, &streamReadError{err: err}
 			}
 		}
-		// 空行（帧分隔）吞掉：本函数自产 "\n\n"
-		if err != nil {
-			if err == io.EOF {
-				break
+		return frames, nil
+	}
+
+	validFrames, pumpErr := pump(r)
+	if pumpErr != nil {
+		return pumpErr
+	}
+
+	// 空回复救援：整条流没有正文、没有工具调用，且以 finish_reason=length 收尾，
+	// 即「思考吃光 max_tokens」形态。此时已攒下的只有 role/finish 这类无信息量的
+	// 元数据帧（一个字节都没发给客户端），丢弃它们换成关闭思考的同额度重发流，
+	// 客户端只会看到一份正常回复。救援失败/未提供 → 按原样补发缓冲，行为与接线前一致。
+	if !committed && o.rescue != nil && finishReason == "length" && !sawToolCalls {
+		if rd2, clean, rerr := o.rescue(); rerr == nil && rd2 != nil {
+			if clean != nil {
+				defer clean()
 			}
-			return err
+			// 上一跳的元数据帧作废：救援流自带 role/开头帧。
+			pending = pending[:0]
+			committed = true
+			contentSeen = false
+			finishReason = ""
+			// 空流判定以救援流为准（救援流要是也是空的，那就是真的空）。
+			validFrames, pumpErr = pump(rd2)
+			if pumpErr != nil {
+				_ = writeOut("data: [DONE]\n\n")
+				return pumpErr
+			}
+		}
+	}
+	if !committed {
+		if werr := flushPending(); werr != nil {
+			return werr
 		}
 	}
 	// 标记修复的尾部收尾：流结束时仍未判定的字节一律原文回吐（绝不吞字节，未闭合
@@ -772,16 +1103,133 @@ readLoop:
 		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
 	}
 	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
-	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+	if err := writeOut("data: [DONE]\n\n"); err != nil {
 		return err
-	}
-	if fl != nil {
-		fl.Flush()
 	}
 	if validFrames == 0 {
 		return errEmptyStream
 	}
 	return nil
+}
+
+// frameHasPayload 该帧是否携带客户端可见内容（正文 / 工具调用 / 非流式 message）。
+// 空回复救援只认「整条流一个字节正文都没有」，因此只要出现其中任一形态即落定。
+func frameHasPayload(obj map[string]any) bool {
+	chs, ok := obj["choices"].([]any)
+	if !ok {
+		return false
+	}
+	for _, ci := range chs {
+		c, _ := ci.(map[string]any)
+		if c == nil {
+			continue
+		}
+		if d, ok := c["delta"].(map[string]any); ok {
+			if s, ok := d["content"].(string); ok && s != "" {
+				return true
+			}
+		}
+		if m, ok := c["message"].(map[string]any); ok {
+			if s, ok := m["content"].(string); ok && s != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// frameHasToolCalls 该帧是否携带工具调用（delta 或 message 形态）。
+// 有工具调用的回合即使正文为空也是合法终态，不触发空回复救援。
+func frameHasToolCalls(obj map[string]any) bool {
+	chs, ok := obj["choices"].([]any)
+	if !ok {
+		return false
+	}
+	for _, ci := range chs {
+		c, _ := ci.(map[string]any)
+		if c == nil {
+			continue
+		}
+		if d, ok := c["delta"].(map[string]any); ok {
+			if tcs, ok := d["tool_calls"].([]any); ok && len(tcs) > 0 {
+				return true
+			}
+		}
+		if m, ok := c["message"].(map[string]any); ok {
+			if tcs, ok := m["tool_calls"].([]any); ok && len(tcs) > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// firstFinishReason 取第一个非空 finish_reason（只读取，不改写帧内容）。
+func firstFinishReason(obj map[string]any) string {
+	chs, _ := obj["choices"].([]any)
+	for _, ci := range chs {
+		c, _ := ci.(map[string]any)
+		if c == nil {
+			continue
+		}
+		if fr, ok := c["finish_reason"].(string); ok && fr != "" {
+			return fr
+		}
+	}
+	return ""
+}
+
+// isBareErrorFrame 形状判定：顶层 {code: 数字, msg: 字符串}，且没有 choices、没有
+// error 对象。上游 11140 安全审核、6021 队列满的实测形态就是这种「200 内嵌失败帧」
+// ——此前只认 error 键，这类帧会被当正常帧透传，账号也不做处置。
+//
+// 宁缺勿滥：必须同时满足四个条件才判为失败帧（code 是数字、msg 是字符串、无
+// choices、无 error），避免把带 code 的正常数据帧误判成错误。
+func isBareErrorFrame(obj map[string]any) bool {
+	if _, ok := obj["error"]; ok {
+		return false
+	}
+	if _, ok := obj["choices"]; ok {
+		return false
+	}
+	if _, ok := obj["code"].(float64); !ok {
+		return false
+	}
+	msg, ok := obj["msg"].(string)
+	return ok && strings.TrimSpace(msg) != ""
+}
+
+// EmptyTruncatedReply 报告聚合响应是否属于「预算被截断且正文为空」：
+// finish_reason 为 length、正文零字节、没有 tool_calls。非流式空回复救援只认这一
+// 形态——有正文的截断是客户端额度语义的正常结果，不动；有工具调用的回合是合法终态。
+func EmptyTruncatedReply(resp map[string]any) bool {
+	if resp == nil {
+		return false
+	}
+	chs, ok := resp["choices"].([]any)
+	if !ok || len(chs) == 0 {
+		return false
+	}
+	for _, ci := range chs {
+		c, ok := ci.(map[string]any)
+		if !ok {
+			return false
+		}
+		if fr, _ := c["finish_reason"].(string); fr != "length" {
+			return false
+		}
+		m, ok := c["message"].(map[string]any)
+		if !ok {
+			return false
+		}
+		if s, _ := m["content"].(string); s != "" {
+			return false
+		}
+		if tcs, ok := m["tool_calls"].([]any); ok && len(tcs) > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // frameGatewayHint 取 error 帧的 gateway_hint（hintFn 缺失/异常返回空串 → 不附加）。

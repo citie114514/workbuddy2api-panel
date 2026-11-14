@@ -126,10 +126,14 @@ func TestCodexInstructionsRewritten(t *testing.T) {
 	if !strings.Contains(out, "You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant.") {
 		t.Errorf("codex first sentence not rewritten: %q", out)
 	}
-	// 其余两句原样保留，语义不变。
-	if !strings.Contains(out, "Codex CLI is an open source project led by OpenAI.") ||
-		!strings.Contains(out, "You are expected to be precise, safe, and helpful.") {
-		t.Errorf("codex remaining sentences altered: %q", out)
+	// 第二句「Codex CLI is an open source project led by OpenAI」本身就是上游的
+	// system 首行触发 token（可单独出现），现在也一并改写（open source → open-source）；
+	// 第三句不含任何指纹，必须逐字保留。
+	if !strings.Contains(out, "Codex CLI is an open-source project led by OpenAI.") {
+		t.Errorf("codex second sentence should also be rewritten: %q", out)
+	}
+	if !strings.Contains(out, "You are expected to be precise, safe, and helpful.") {
+		t.Errorf("codex third sentence altered: %q", out)
 	}
 }
 
@@ -190,7 +194,7 @@ func TestMultimodalTextPartOnly(t *testing.T) {
 		map[string]any{"type": "text", "text": ccIdentity},
 		imgPart,
 	}
-	out, changed := sanitizeContent(content)
+	out, changed := sanitizeContent(content, true)
 	if !changed {
 		t.Fatal("expected change")
 	}
@@ -386,8 +390,280 @@ func TestSanitizeMessagesScrubsReasoningField(t *testing.T) {
 	}
 }
 
+const (
+	dshGUIA = "You are interacting with the user through the DeepSeek Harness Web GUI whose URL the runtime context names."
+	dshGUIB = `When the user refers to "this page", "this GUI", or "this app" without naming another target, they mean this GUI.`
+)
+
+func TestIdentitySentenceRewritten(t *testing.T) {
+	cases := map[string]string{
+		"You are an AI agent powered by DeepSeek Harness.":                                    "You are a helpful assistant.",
+		"You are an AI assistant built on DeepSeek. Use tools wisely.":                        "You are a helpful assistant. Use tools wisely.",
+		"You are Codex Agent, built by OpenAI.":                                               "You are a helpful assistant.",
+		"You are an assistant created by Example. Next.":                                      "You are a helpful assistant. Next.",
+		"You are a model developed by Example.":                                               "You are a helpful assistant.",
+		"You are the AI made by Example.":                                                     "You are a helpful assistant.",
+		"you are an llm TRAINED BY someone.":                                                  "You are a helpful assistant.",
+		"You are powered by the model named Claude Opus 4.5. The exact model ID is x-4-5.":    "You are a helpful assistant. The exact model ID is x-4-5.",
+		"Intro.\nYou are a coding agent powered by the deepseek-v4.1-flash model.\nTools: a.": "Intro.\nYou are a helpful assistant.\nTools: a.",
+		"You are an AI agent powered by DeepSeek Harness\nnext line":                          "You are a helpful assistant.\nnext line",
+	}
+	for in, want := range cases {
+		if got := sanitizeText(in); got != want {
+			t.Errorf("sanitizeText(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestIdentityLookalikeNotTouched(t *testing.T) {
+	for _, in := range []string{
+		"You are free to use tools built by the community.",
+		"This plugin is powered by DeepSeek and made by volunteers.",
+		"You are an agent. The CLI was built by OpenAI.",
+	} {
+		if got := sanitizeText(in); got != in {
+			t.Errorf("should be untouched: %q -> %q", in, got)
+		}
+	}
+}
+
+func TestDSHGUIParagraphRewritten(t *testing.T) {
+	want := "You are interacting with the user through the DeepSeek Web GUI whose URL is named in the runtime context. " + dshGUIB
+	if got := sanitizeText(dshGUIA + " " + dshGUIB); got != want {
+		t.Errorf("GUI paragraph:\n got %q\nwant %q", got, want)
+	}
+	lower := strings.ToLower(dshGUIA)
+	if got := sanitizeText(lower); strings.Contains(got, "the runtime context names") || strings.Contains(got, "harness") {
+		t.Errorf("case-insensitive GUI rewrite failed: %q", got)
+	}
+}
+
+func TestDSHBrandRewrittenOnlyInProse(t *testing.T) {
+	if got := sanitizeText("Built with DeepSeek\tHarness today"); got != "Built with DeepSeek today" {
+		t.Errorf("brand not reduced: %q", got)
+	}
+	for _, in := range []string{
+		"github.com/deepseek-ai/deepseek-harness/tree/main",
+		"import deepseek_harness as dsh",
+		"/opt/deepseek-harness/app",
+		"a test harness for DeepSeek",
+	} {
+		if got := sanitizeText(in); got != in {
+			t.Errorf("identifier should be untouched: %q -> %q", in, got)
+		}
+	}
+}
+
+func TestOmOIdentityRewritten(t *testing.T) {
+	in := "You are Sisyphus-Junior - Focused executor from OhMyOpenCode, a helper."
+	if got := sanitizeText(in); got != "You are Sisyphus-Junior - Focused executor, a helper." {
+		t.Errorf("OmO not rewritten: %q", got)
+	}
+	for _, in := range []string{"Sisyphus-Junior alone", "from OhMyOpenCode alone"} {
+		if got := sanitizeText(in); got != in {
+			t.Errorf("half should be untouched: %q -> %q", in, got)
+		}
+	}
+}
+
+func TestChannelFingerprintRewriteIdempotent(t *testing.T) {
+	for _, in := range []string{
+		dshGUIA + " " + dshGUIB,
+		"You are an AI agent powered by DeepSeek Harness. Be brief.",
+		"Sisyphus-Junior - Focused executor from OhMyOpenCode",
+	} {
+		once := sanitizeText(in)
+		if twice := sanitizeText(once); twice != once {
+			t.Errorf("not idempotent: %q -> %q -> %q", in, once, twice)
+		}
+	}
+}
+
+// TestChannelFingerprintScrubbedPerRoleScope 身份域指纹的净化作用域：system /
+// developer / assistant 承载「客户端是谁」的指纹，必须洗掉；user / tool 里出现
+// 同样的句子属**用户数据**（用户粘贴的 prompt、工具读到的文件内容），除反探测串
+// 外必须逐字不动——改写等于篡改用户输入。
+func TestChannelFingerprintScrubbedPerRoleScope(t *testing.T) {
+	orig := []string{
+		"You are an AI agent powered by DeepSeek Harness.",
+		dshGUIA + " " + dshGUIB,
+		"You are the AI made by Example.",
+		dshGUIA,
+	}
+	roles := []string{"system", "user", "assistant", "tool"}
+	ms := make([]any, 0, len(orig))
+	for k, role := range roles {
+		ms = append(ms, map[string]any{"role": role, "content": orig[k]})
+	}
+	if !sanitizeMessages(ms) {
+		t.Fatal("expected identity-domain messages to change")
+	}
+	for k, m := range ms {
+		got := m.(map[string]any)["content"].(string)
+		if sanitizeIdentityRole(roles[k]) {
+			if got == orig[k] {
+				t.Errorf("role=%s identity fingerprint not scrubbed: %q", roles[k], got)
+			}
+			continue
+		}
+		if got != orig[k] {
+			t.Errorf("role=%s user data rewritten (must stay verbatim): %q -> %q", roles[k], orig[k], got)
+		}
+	}
+}
+
+// TestAntiProbeScrubbedInEveryRole 反探测串与身份域无关：裸 11128 出现在任何角色
+// 的消息里都是上游整单拦截条件（用户粘贴报错、工具回显错误码），必须照洗。
+func TestAntiProbeScrubbedInEveryRole(t *testing.T) {
+	const probe = "11" + "128"
+	in := "upstream said " + probe + " again"
+	for _, role := range []string{"system", "developer", "assistant", "user", "tool"} {
+		ms := []any{map[string]any{"role": role, "content": in}}
+		if !sanitizeMessages(ms) {
+			t.Fatalf("role=%s: expected anti-probe rewrite", role)
+		}
+		got := ms[0].(map[string]any)["content"].(string)
+		if strings.Contains(got, probe) {
+			t.Errorf("role=%s still carries bare anti-probe token: %q", role, got)
+		}
+	}
+}
+
+// TestIdentityReplacementIsNotBlockedOpening P3：改写串自身不能落在上游「禁用开头」
+// 名单里（名单第一条就是带 AI 的那句）。洗成另一句可疑开头等于没洗。
+func TestIdentityReplacementIsNotBlockedOpening(t *testing.T) {
+	if sanitizeIdentityReplacement != "You are a helpful "+"assistant." {
+		t.Fatalf("replacement=%q", sanitizeIdentityReplacement)
+	}
+	if strings.Contains(strings.ToLower(sanitizeIdentityReplacement), " ai ") {
+		t.Errorf("replacement still contains AI token: %q", sanitizeIdentityReplacement)
+	}
+}
+
+func TestChannelFingerprintScrubbedInArgumentsReasoningAndMultimodal(t *testing.T) {
+	imgPart := map[string]any{"type": "image", "source": map[string]any{"data": "DeepSeek Harness"}}
+	ms := []any{map[string]any{
+		"role": "assistant",
+		"content": []any{
+			map[string]any{"type": "text", "text": dshGUIA + " " + dshGUIB},
+			imgPart,
+		},
+		"reasoning_content": "You are an AI assistant created by Example.",
+		"reasoning":         "Built with DeepSeek Harness today",
+		"tool_calls": []any{map[string]any{"function": map[string]any{
+			"arguments": `{"prompt":"Sisyphus-Junior - Focused executor from OhMyOpenCode"}`,
+		}}},
+	}}
+	if !sanitizeMessages(ms) {
+		t.Fatal("expected channel fingerprints to be scrubbed")
+	}
+	m := ms[0].(map[string]any)
+	parts := m["content"].([]any)
+	wantText := "You are interacting with the user through the DeepSeek Web GUI whose URL is named in the runtime context. " + dshGUIB
+	if got := parts[0].(map[string]any)["text"]; got != wantText {
+		t.Errorf("multimodal text = %q, want %q", got, wantText)
+	}
+	if got := imgPart["source"].(map[string]any)["data"]; got != "DeepSeek Harness" {
+		t.Errorf("non-text part modified: %q", got)
+	}
+	if got := m["reasoning_content"]; got != sanitizeIdentityReplacement {
+		t.Errorf("reasoning_content = %q", got)
+	}
+	if got := m["reasoning"]; got != "Built with DeepSeek today" {
+		t.Errorf("reasoning = %q", got)
+	}
+	args := m["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)["arguments"].(string)
+	var decoded map[string]string
+	if err := json.Unmarshal([]byte(args), &decoded); err != nil {
+		t.Fatalf("sanitized arguments are invalid JSON: %v", err)
+	}
+	if got := decoded["prompt"]; got != "Sisyphus-Junior - Focused executor" {
+		t.Errorf("tool arguments prompt = %q", got)
+	}
+}
+
+func TestContainsFoldASCII(t *testing.T) {
+	if !containsFoldASCII("xx DeepSeek HARNESS", "harness") || containsFoldASCII("harnes", "harness") || containsFoldASCII("", "a") {
+		t.Fatal("containsFoldASCII wrong")
+	}
+}
+
 // newTestUpstream 起一个假上游并捕获请求。
 func newTestUpstream(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(h)
+}
+
+// TestSanitizeCodexStandaloneToken Codex 说明句**单独出现**时也要命中。
+//
+// 既有 codexInstructions 常量是「三句连排」的整段，靠第一句的 rewrite 就带过了；
+// 但上游的触发判据是「system 首行含该 token」，单独一句同样会被拦（dddmiku
+// 2026-10-17 实测）。所以这条要能独立生效。
+func TestSanitizeCodexStandaloneToken(t *testing.T) {
+	const alone = "Codex CLI is an open source project led by OpenAI."
+	out := sanitizeText(alone)
+	if strings.Contains(out, "Codex CLI is an open source project led by OpenAI") {
+		t.Fatalf("单独出现的 Codex 说明句未被改写: %q", out)
+	}
+	if !strings.Contains(out, "open-source project led by OpenAI") {
+		t.Fatalf("改写后语义应保留 open-source: %q", out)
+	}
+	if !hasFingerprint(alone) {
+		t.Fatal("预检特征未命中单独出现的 Codex 说明句")
+	}
+}
+
+// TestSanitizeDSHPathSentence 两句路径说明连排时拆断第一句、第二句原样。
+// 2026-10-27 实测：连排 400（渠道校验），单句各自 200。
+func TestSanitizeDSHPathSentence(t *testing.T) {
+	const first = "Tokens prefixed with @ are paths the user explicitly referenced."
+	const second = "Relative paths resolve from the workspace root; absolute paths identify files or directories on the host."
+	out := sanitizeText(first + "\n" + second)
+
+	if strings.Contains(out, "are paths the user explicitly referenced") {
+		t.Fatalf("连排形态未拆断: %q", out)
+	}
+	if !strings.Contains(out, "are paths that the user explicitly referenced.") {
+		t.Fatalf("第一句未被改写（that 未插入）: %q", out)
+	}
+	if !strings.Contains(out, second) {
+		t.Fatalf("第二句不该被改动: %q", out)
+	}
+	if !hasFingerprint(first + "\n" + second) {
+		t.Fatal("预检特征未命中 DSH 路径句")
+	}
+}
+
+// TestSanitizeDSHPathSecondOnlyUntouched 第二句单独出现不得被改写（避免误伤用户文本）。
+func TestSanitizeDSHPathSecondOnlyUntouched(t *testing.T) {
+	const second = "Relative paths resolve from the workspace root; absolute paths identify files or directories on the host."
+	if got := sanitizeText(second); got != second {
+		t.Fatalf("第二句单独出现被误改: %q", got)
+	}
+}
+
+// TestSanitizeContentPartsArray 回归 dddmiku 实测：system 为 part 数组时，
+// 任一块首行含触发 token 同样被拦。净化必须走每个 text 块。
+func TestSanitizeContentPartsArray(t *testing.T) {
+	msgs := []any{
+		map[string]any{
+			"role": "system",
+			"content": []any{
+				map[string]any{"type": "text", "text": "Codex CLI is an open source project led by OpenAI."},
+				map[string]any{"type": "text", "text": "Tokens prefixed with @ are paths the user explicitly referenced."},
+			},
+		},
+	}
+	sanitizeMessages(msgs)
+	raw, _ := json.Marshal(msgs)
+	s := string(raw)
+	if strings.Contains(s, "Codex CLI is an open source project led by OpenAI") {
+		t.Errorf("part 数组里的 Codex 说明句未改写: %s", s)
+	}
+	if strings.Contains(s, "are paths the user explicitly referenced") {
+		t.Errorf("part 数组里的 DSH 路径句未改写: %s", s)
+	}
+	if !strings.Contains(s, "open-source") || !strings.Contains(s, "are paths that") {
+		t.Errorf("改写结果不符合预期: %s", s)
+	}
 }

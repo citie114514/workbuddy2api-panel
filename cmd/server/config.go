@@ -22,6 +22,8 @@ type Config struct {
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+	// TimeoutRotateExtra 传输层超时后的额外换号预算；默认 1，显式 0 关闭。
+	TimeoutRotateExtra int `json:"timeout_rotate_extra"`
 	// DNSServers 出站解析用的 DNS 服务器（空 = 系统解析器）；也可用 WB2A_DNS 覆盖。
 	// Android/magisk 模块里没有 /etc/resolv.conf，必须显式指定，否则解析全落本机 :53。
 	DNSServers []string `json:"dns_servers,omitempty"`
@@ -55,6 +57,10 @@ type Config struct {
 		// 400 "read body: ... i/o timeout"。缺省 "300s"；"0" = 不限制
 		//（慢速 body 可无限占用连接，自担风险）；改动需重启进程。
 		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
+		// ShutdownTimeout 收到退出信号后等待在途请求结束的窗口（缺省 "30s"）。
+		// 在途 SSE 的合法时长可达分钟级，旧的固定 5s 必然把在途流掐成连接重置；
+		// "0" = 立即退出（不等在途），负值 fail fast。改动需重启进程。
+		ShutdownTimeout string `json:"shutdown_timeout,omitempty"` // "30s"
 	} `json:"server"`
 
 	Cooldown struct {
@@ -72,8 +78,12 @@ type Config struct {
 		TravelHours    []int `json:"travel_hours"`    // [9,21]
 		ActivityHours  []int `json:"activity_hours"`  // [10]
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
-		BlackcatHours  []int `json:"blackcat_hours"`  // [23] 夜猫子窗口（23:00–08:00 计数）
-		GrowthHours    []int `json:"growth_hours"`    // [1] 成长任务队列（Sequential 族每日零点解锁，01:00 自动扫描执行）
+		// KeepaliveRefreshWindow 周期保活的临期窗口：排程到点只刷新剩余有效期
+		// 不超过该时长的 token（已过期/无到期时间始终刷新）；面板手动保活仍
+		// 全量。空 = 默认 "168h"，非法或非正值启动报错。
+		KeepaliveRefreshWindow string `json:"keepalive_refresh_window"`
+		BlackcatHours          []int  `json:"blackcat_hours"` // [23] 夜猫子窗口（23:00–08:00 计数）
+		GrowthHours            []int  `json:"growth_hours"`   // [1] 成长任务队列（Sequential 族每日零点解锁，01:00 自动扫描执行）
 		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -88,7 +98,15 @@ type Config struct {
 		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
 		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
 		BlackcatEnabled  bool `json:"blackcat_enabled"`  // 缺省 true；false = 关夜猫子
-		GrowthEnabled    bool `json:"growth_enabled"`    // 缺省 true；false = 关成长任务自动排程
+		// BalanceRefreshJitterPermill / TaskSweepJitterPermill 分钟级周期任务的间隔
+		// 抖动幅度（千分数，0–500，缺省 0 = 精确固定间隔）。让每轮不再整点对齐，
+		// 避免同一出口 IP 上全部账号按机器节拍活动。
+		BalanceRefreshJitterPermill int `json:"balance_refresh_jitter_permill"`
+		TaskSweepJitterPermill      int `json:"task_sweep_jitter_permill"`
+		// NightAccountCap 夜猫子参与上限（0 = 不限）。>0 时夜间真实对话只让积分最高
+		// 的前 N 个账号做，其余夜间静默；白天任务仍全池保号。
+		NightAccountCap int  `json:"night_account_cap"`
+		GrowthEnabled   bool `json:"growth_enabled"` // 缺省 true；false = 关成长任务自动排程
 
 		// IncludeDisabledInTasks 让「保号类」定时任务（签到 / 活跃上报 / token 保活 /
 		// 余额刷新）对**已禁用（disabled）**的账号也执行。
@@ -134,10 +152,10 @@ type Config struct {
 
 	CN struct {
 		// ChatBase 国内版 chat/模型目录上游 base 覆盖；空 = 回落内置默认
-		// https://copilot.tencent.com（internal/upstream.New 的 ChatBaseCN）。
-		// copilot.tencent.com 对海外出口（如 Clash 全局 + TUN）的 TLS 握手直接复位，
-		// CN 模型目录与对话全部 EOF；官方 WorkBuddy 桌面端已改用 https://www.workbuddy.cn，
-		// 该域海外出口可达，/v2/chat/completions、/v3/config 与模型目录路径同构。
+		// https://www.workbuddy.cn（internal/upstream.New 的 ChatBaseCN，即官方桌面端
+		// 的对话主域）。
+		// 备选入口 copilot.tencent.com 对海外出口（如 Clash 全局 + TUN）的 TLS 握手
+		// 直接复位，CN 模型目录与对话全部 EOF；需要回退时用它填这个键。
 		ChatBase string `json:"chat_base"`
 	} `json:"cn"`
 
@@ -172,6 +190,12 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// DebugLogOutboundBody 4xx 时把出站请求体写进日志（默认 false）。
+		//
+		// 排障专用：上游 400 的原因（stop 类型、工具配对、参数超范围）几乎只在出站
+		// 请求体里看得出来，而日志默认只有上游回包。body 里含用户内容，所以默认关闭、
+		// 由使用者显式打开；写日志前会剥掉 data URL 的 base64 内容并截断长度。
+		DebugLogOutboundBody bool `json:"debug_log_outbound_body"`
 	} `json:"features"`
 
 	Models struct {
@@ -194,6 +218,21 @@ type Config struct {
 	// PromptText 解析后的系统提示词文本（custom/append 模式使用）。
 	PromptText string `json:"-"`
 
+	// Alert 风控信号告警。把「上游开始收紧」的早期迹象（11128 通道校验 / 403 WAF /
+	// 12153 session 失效 / 11140 渠道校验）推到 webhook，同类事件 30 分钟静默一次。
+	// 只做投递不做规则引擎：阈值与判定写在 server 侧的 noteRiskSignal 里。
+	Alert struct {
+		Enabled bool `json:"enabled"`
+		// Webhook 投递地址。通用 webhook 直接 POST JSON；PushPlus 填
+		// https://www.pushplus.plus/send 并把令牌写进 token 字段。留空 = 不推送。
+		Webhook string `json:"webhook"`
+		// Token 可选：随请求体一起发送。PushPlus 的 /send 要求 body 里带用户令牌；
+		// 通用 webhook 会忽略这个多余字段。
+		Token string `json:"token"`
+		// MinIntervalSeconds 同类事件的静默窗口（秒），缺省 1800（30 分钟）。
+		MinIntervalSeconds int `json:"min_interval_seconds"`
+	} `json:"alert"`
+
 	Upstash struct {
 		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host
 		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379
@@ -214,14 +253,18 @@ type Config struct {
 		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
-		// PreferExpiring 快过期积分加权开关，默认 true。开启且 expiring_soon 窗口内
-		// 存在有效批次时，该账号选号权重 ×3（虚拟实例，见 pool 路由加权）；
-		// 不按到期时间排序、与批次金额无关（issue #101 对齐实现口径）。
+		// PreferExpiring 快过期积分加权开关，默认 true。开启后，窗口内有到期批次的
+		// 账号按**紧迫度排名**获得阶梯权重：第 1..5 名 ×8/×6/×5/×4/×3，第 6 名及
+		// 以后 ×3（与改造前的统一 ×3 一致，不降权）。排名键为该账号最早到期批次的时间
+		// 升序，同一时刻按该批剩余量降序（浪费得多先花）。
 		// 关闭后完全不使用到期信息选号。
 		PreferExpiring bool `json:"prefer_expiring"`
-		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到/余额刷新时，到期时间在
-		// 此窗口内的批次令账号命中上述 ×3 加权；窗口开大 → 命中账号变多、
-		// 偏好被稀释。空/0 = 禁用该加权门槛。
+		// ExpiringSoon 快过期积分主窗口（如 "168h"=7天）：签到/余额刷新时，到期时间在
+		// 此窗口内的批次令账号进入上述加权排名；窗口开大 → 命中账号变多、偏好被稀释。
+		// 空/0 = 禁用该加权门槛。
+		// 回退：该域内主窗口一个到期批次都没有时，选号自动放宽到 14 天再排一次——
+		// 官方积分批次常是「同一波签到、十几天后同批到期」，主窗口在批次中段会整段为空，
+		// 不放宽等于偏好失效。主窗口一有账号进入就立刻切回（见 pool expiringFallbackWindow）。
 		ExpiringSoon string `json:"expiring_soon"`
 		// CostExploreInterval costTier 条件探索窗口（issue #136 方案 a′）：tier 0
 		// 垄断层存在且 tier 1 有成员时，距上次探索 ≥ 窗口则本次 pick 生效层切
@@ -240,11 +283,11 @@ type Config struct {
 		// 另一域再选一次；显式 cn:/global: 前缀不受影响，行为与引入前完全一致。
 		// 语义取舍：跨域会消耗另一个域的额度，属策略选择，故默认关闭、显式开启。
 		CrossDomainFallback bool `json:"cross_domain_fallback"`
-		// ModelFallbackEnabled 模型付费回退开关（v1.15），默认 true。
+		// ModelFallbackEnabled 模型付费回退开关，默认 true。
 		// 对齐官方客户端行为：免费额度型模型（如 global:deepseek-v4.1-flash，x0.00）
 		// 额度用尽后上游报 6004 模型级限流，官方客户端此时自动切到同名付费兄弟型号
 		// （deepseek-v4.1-flash-sg，x0.03）继续可用。开启后网关在「整个池子对该模型
-		// 模型级阻塞」时改用回退型号重选一次；请求被计费按回退型号的真实倍率。
+		// 模型级配额阻塞」时改用回退型号重选一次；请求被计费按回退型号的真实倍率。
 		// 内置规则 = 同域 "<model>-sg" 且上游目录存在该型号；显式映射可覆盖/扩展。
 		ModelFallbackEnabled bool `json:"model_fallback_enabled"`
 		// ModelFallback 自定义回退映射（键 "realm:model"，值同域目标裸模型名），
@@ -270,10 +313,14 @@ type Config struct {
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
 	TaskSweepInterval      time.Duration `json:"-"` // 0 = 不启动（task_sweep_enabled=false）
 	ExpiringSoonDur        time.Duration `json:"-"`
+	// KeepaliveRefreshWindowDur 解析后的周期保活临期窗口，默认 7 天。
+	KeepaliveRefreshWindowDur time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// ServerShutdownTimeoutDur 解析后的优雅关停窗口；0 = 立即退出。
+	ServerShutdownTimeoutDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -284,9 +331,11 @@ func Default() *Config {
 		AuthDir:   "./auths",
 		StateFile: "./data/state.json",
 	}
+	c.TimeoutRotateExtra = 1
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.ReadTimeout = "300s"
+	c.Server.ShutdownTimeout = "30s"
 	c.Panel.PackageDetailLimit = 5
 	c.Logging.RequestArchiveEnabled = true
 	c.Logging.RequestRetentionDays = 7
@@ -294,12 +343,16 @@ func Default() *Config {
 	// 缺省 true 靠显式赋值实现（同 Schedule 开关）：JSON 里键缺席时字段保留此值，
 	// 只有显式 false 才关闭来源记录。
 	c.Logging.RequestClientInfo = true
+	c.Alert.MinIntervalSeconds = 1800 // 同类风控信号 30 分钟静默一次
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.TravelHours = []int{9, 21}
 	c.Schedule.ActivityHours = []int{10}
 	c.Schedule.KeepaliveHours = []int{22}
+	c.Schedule.KeepaliveRefreshWindow = "168h"
 	c.Schedule.BlackcatHours = []int{23}
-	c.Schedule.GrowthHours = []int{1}
+	// 成长任务默认 15:00 而不是 01:00：凌晨让全池账号同时活动是最容易被识别的
+	// 「不是人」特征之一（真人极少在凌晨一点刷成长任务）。
+	c.Schedule.GrowthHours = []int{15}
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
 	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
 	c.Schedule.CheckinEnabled = true
@@ -310,6 +363,10 @@ func Default() *Config {
 	c.Schedule.BlackcatEnabled = true
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
+	// 周期任务间隔抖动默认 ±20%：不让每轮刷新/扫描落在精确整点。0 是旧行为
+	// （逐字不变），但「精确打卡」本身就是机器特征，默认值应当偏向像人。
+	c.Schedule.BalanceRefreshJitterPermill = 200
+	c.Schedule.TaskSweepJitterPermill = 200
 	c.Schedule.TaskSweepEnabled = true
 	c.Schedule.TaskSweepMinutes = 15
 	c.Upstream.TimeoutSeconds = 120
@@ -320,7 +377,8 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
-	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
+	c.Features.DebugLogOutboundBody = false // 排障开关：默认关闭（含用户内容）
+	c.Prompt.Mode = "passthrough"           // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.Strategy = pool.RegionStrategies{Domestic: pool.WeightedRandom, International: pool.WeightedRandom}
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
@@ -339,8 +397,8 @@ func Default() *Config {
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
-	// 模型付费回退默认开启（对齐官方客户端：免费额度用尽自动切付费兄弟型号，
-	// v1.15）。键缺席时保留 true，显式 false 才关。
+	// 模型付费回退默认开启（对齐官方客户端：免费额度用尽自动切付费兄弟型号）。
+	// 键缺席时保留 true，显式 false 才关。
 	c.Pool.ModelFallbackEnabled = true
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
@@ -487,6 +545,11 @@ func applyEnv(c *Config) {
 			c.Features.SanitizeBlacklistFingerprints = b
 		}
 	}
+	if v := os.Getenv("WB2A_DEBUG_LOG_OUTBOUND_BODY"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.DebugLogOutboundBody = b
+		}
+	}
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
 		c.Prompt.Mode = v
 	}
@@ -508,8 +571,27 @@ func applyEnv(c *Config) {
 
 func (c *Config) normalize() error {
 	var err error
+	if c.TimeoutRotateExtra < 0 {
+		return fmt.Errorf("timeout_rotate_extra: 不能为负数")
+	}
 	if c.Pool.Strategy, err = c.Pool.Strategy.Normalize(); err != nil {
 		return fmt.Errorf("pool.strategy: %w", err)
+	}
+	// 人味化参数：抖动幅度 0–500（千分数），越界报错而不是静默钳——静默钳会让人
+	// 以为配置生效了。夜猫子上限 <0 无语义，同样报错。
+	for _, kv := range []struct {
+		name string
+		v    int
+	}{
+		{"schedule.balance_refresh_jitter_permill", c.Schedule.BalanceRefreshJitterPermill},
+		{"schedule.task_sweep_jitter_permill", c.Schedule.TaskSweepJitterPermill},
+	} {
+		if kv.v < 0 || kv.v > 500 {
+			return fmt.Errorf("%s: %d 超出 0–500", kv.name, kv.v)
+		}
+	}
+	if c.Schedule.NightAccountCap < 0 {
+		return fmt.Errorf("schedule.night_account_cap: %d 不能为负", c.Schedule.NightAccountCap)
 	}
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
@@ -530,6 +612,17 @@ func (c *Config) normalize() error {
 	}
 	if c.ServerReadTimeoutDur < 0 {
 		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
+	}
+	// 优雅关停窗口：空值回落 30s；"0" = 立即退出；负值 fail fast。
+	// 旧实现硬编码 5s，在途 SSE 合法时长可达分钟级，必然被掐成连接重置。
+	if c.Server.ShutdownTimeout == "" {
+		c.Server.ShutdownTimeout = "30s"
+	}
+	if c.ServerShutdownTimeoutDur, err = time.ParseDuration(c.Server.ShutdownTimeout); err != nil {
+		return fmt.Errorf("server.shutdown_timeout: %w", err)
+	}
+	if c.ServerShutdownTimeoutDur < 0 {
+		return fmt.Errorf("server.shutdown_timeout: 负时长 %q 无意义", c.Server.ShutdownTimeout)
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
@@ -636,11 +729,22 @@ func (c *Config) normalize() error {
 	if len(c.Schedule.KeepaliveHours) == 0 {
 		c.Schedule.KeepaliveHours = []int{22}
 	}
+	// 周期保活临期窗口：空值回落 168h；非法/非正值 fail fast，避免拼错后退化成
+	// 每日全量刷新而无人察觉。
+	if c.Schedule.KeepaliveRefreshWindow == "" {
+		c.Schedule.KeepaliveRefreshWindow = "168h"
+	}
+	if c.KeepaliveRefreshWindowDur, err = time.ParseDuration(c.Schedule.KeepaliveRefreshWindow); err != nil {
+		return fmt.Errorf("schedule.keepalive_refresh_window: %w", err)
+	}
+	if c.KeepaliveRefreshWindowDur <= 0 {
+		return fmt.Errorf("schedule.keepalive_refresh_window: %q 必须为正时长（如 168h）", c.Schedule.KeepaliveRefreshWindow)
+	}
 	if len(c.Schedule.BlackcatHours) == 0 {
 		c.Schedule.BlackcatHours = []int{23}
 	}
 	if len(c.Schedule.GrowthHours) == 0 {
-		c.Schedule.GrowthHours = []int{1}
+		c.Schedule.GrowthHours = []int{15}
 	}
 	// 余额后台刷新：启用时 minutes<=0 回落默认 5；关闭时 interval 保持 0（不启动）。
 	if c.Schedule.BalanceRefreshEnabled {

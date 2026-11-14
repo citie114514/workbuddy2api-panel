@@ -4,6 +4,8 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -16,6 +18,27 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
+
+// outboundBody 读出站 body（基线默认 gzip 压缩请求体，断言前必须解压）。
+func outboundBody(r *http.Request) []byte {
+	if r.Body == nil {
+		return nil
+	}
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil
+	}
+	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
+		zr, gerr := gzip.NewReader(bytes.NewReader(raw))
+		if gerr != nil {
+			return nil
+		}
+		if plain, derr := io.ReadAll(zr); derr == nil {
+			return plain
+		}
+	}
+	return raw
+}
 
 // fakeContextUpstream 复刻上游的越界口径：prompt + 输出预留 > limit → 400/11115。
 // 预留取值：显式 max_tokens（不超过 clamp）原样用，否则用 defaultReserve。
@@ -32,7 +55,7 @@ func (f *fakeContextUpstream) client(t *testing.T) *upstream.Client {
 	t.Helper()
 	return &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-			raw, _ := io.ReadAll(r.Body)
+			raw := outboundBody(r)
 			var body struct {
 				MaxTokens *int64 `json:"max_tokens"`
 			}

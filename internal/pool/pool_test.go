@@ -159,7 +159,9 @@ func TestPickWeightedUniformWhenAllZero(t *testing.T) {
 
 func TestPickWeightedTopFiveOnly(t *testing.T) {
 	withNoPickGap(t)
-	// 第 6 高 credits 的账号在 Top5 之外，权重抽签永远轮不到它。
+	// Top5 截断的机械语义：首轮按当前权重截短名单，第 6 高 credits 的账号不入选。
+	// 后续轮次负载均衡会压低高频号的权重，闲置的 a6 最终会被轮进来——这是设计目标，
+	// 不应再断言 2000 轮永不选中。
 	p := New("")
 	for _, u := range []string{"a1", "a2", "a3", "a4", "a5", "a6"} {
 		p.Add(&auth.Auth{UID: u})
@@ -170,10 +172,8 @@ func TestPickWeightedTopFiveOnly(t *testing.T) {
 	p.SetCredits("a4", 1000, 0)
 	p.SetCredits("a5", 1000, 0)
 	p.SetCredits("a6", 5, 0) // Top5 之外
-	for i := 0; i < 2000; i++ {
-		if got := p.Pick(); got == nil || got.UID == "a6" {
-			t.Fatalf("iter %d: picked %+v, a6 must stay outside top-5", i, got)
-		}
+	if got := p.Pick(); got == nil || got.UID == "a6" {
+		t.Fatalf("first pick=%+v, a6 must stay outside top-5", got)
 	}
 }
 
@@ -205,17 +205,42 @@ func TestPickTopFiveByIdleNotCredits(t *testing.T) {
 
 func TestPickDeterministicViaSetRandomSource(t *testing.T) {
 	withNoPickGap(t)
-	p := New("")
-	p.SetRandomSource(func(n int64) int64 { return 0 })
-	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
-	p.SetCredits("u1", 100, 0)
-	p.SetCredits("u2", 50, 0)
-	// r=0 ∈ [0,50) → 命中 u1。注入源应使选号完全确定。
+	// 注入随机源的契约是「同参数下序列可重放」，不是「永远命中同一个号」：
+	// 负载均衡会在某号连续中选后压低其权重，把后续轮次摊给另一号。
+	build := func() *Pool {
+		p := New("")
+		p.SetRandomSource(func(n int64) int64 { return 0 })
+		p.Add(&auth.Auth{UID: "u1"})
+		p.Add(&auth.Auth{UID: "u2"})
+		p.SetCredits("u1", 100, 0)
+		p.SetCredits("u2", 50, 0)
+		return p
+	}
+	p1, p2 := build(), build()
+	seq1, seq2 := make([]string, 50), make([]string, 50)
 	for i := 0; i < 50; i++ {
-		if got := p.Pick(); got == nil || got.UID != "u1" {
-			t.Fatalf("iter %d: pick=%+v want u1 (deterministic)", i, got)
+		a, b := p1.Pick(), p2.Pick()
+		if a == nil || b == nil {
+			t.Fatalf("iter %d: pick nil (a=%v b=%v)", i, a, b)
 		}
+		seq1[i], seq2[i] = a.UID, b.UID
+		if seq1[i] != seq2[i] {
+			t.Fatalf("iter %d: injected sequence must replay, %s vs %s", i, seq1[i], seq2[i])
+		}
+	}
+	seen := map[string]bool{}
+	u1 := 0
+	for _, uid := range seq1 {
+		seen[uid] = true
+		if uid == "u1" {
+			u1++
+		}
+	}
+	if !seen["u1"] || !seen["u2"] {
+		t.Fatalf("balanced sequence should cover both accounts, seq=%v", seq1)
+	}
+	if u1 <= 25 {
+		t.Fatalf("u1 (credits=100) should remain the majority, got %d/50: %v", u1, seq1)
 	}
 }
 
@@ -892,20 +917,18 @@ func TestCooldownSoftForModelParsedUntil(t *testing.T) {
 	}
 }
 
-func TestCooldownSoftForModelCappedBySoftRateMax(t *testing.T) {
-	// 解析时间超出 soft_rate_max → 截断到 soft_rate_max（不无限期拉黑）。
+func TestCooldownSoftForModelNotCappedBySoftRateMax(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.SetSoftRateMax(10 * time.Minute)
-	reset := time.Now().Add(2 * time.Hour) // 远超过封顶 10m
-	before := time.Now()
+	reset := time.Now().Add(2 * time.Hour)
 	p.CooldownSoftForModel("u1", 600*time.Second, reset, "glm-5.3", "429 rate limit")
 	st, _ := p.Status("u1")
 	if len(st.RateLimitedModels) != 1 {
 		t.Fatalf("want model ledger row: %+v", st.RateLimitedModels)
 	}
-	if st.RateLimitedModels[0].Until.Sub(before) > 10*time.Minute+time.Second {
-		t.Errorf("model until=%v want capped at soft_rate_max=10m", st.RateLimitedModels[0].Until)
+	if !st.RateLimitedModels[0].Until.Equal(reset) {
+		t.Errorf("model until=%v want explicit reset %v", st.RateLimitedModels[0].Until, reset)
 	}
 }
 
@@ -989,10 +1012,41 @@ func TestPickExcludingForModelBreakerStillBlocks(t *testing.T) {
 	}
 }
 
-// TestSoftRateModelClearedByPlainCooldown 回归：6004 模型冷却后，若账号又经历一次
-// **非模型级**软冷却（plain Cooldown），softRateModel 必须被清空——否则上次 6004 的
-// 模型豁免会泄漏到本次账号级限流上，导致"换模型请求"错误绕过本次冷却。
-func TestSoftRateModelClearedByPlainCooldown(t *testing.T) {
+// TestAccountCooldownKeepsModelFreeze 账号级冷却与模型级冷冻**正交**（P2）：
+//   - 账号级冷却期间整号不可选（换模型也不行）——这层安全性由 healthyForModel
+//     末尾的 e.healthy(now) 保证，不依赖「顺手清掉模型冷却」；
+//   - 账号级冷却到期后，(账号, 模型) 的 6004 冷冻仍在——不会被「账号在别的模型上
+//     吃一次 429」抹掉，否则解冻后立刻再撞同一模型的限流墙（多号池里的典型表现：
+//     提示 15:22 恢复，2h 后又撞一次 6004）。
+//
+// TestFallbackHonorsModelCooldown 全冷却兜底必须遵守模型级冷冻（A1）。
+//
+// 回归背景：模型级冷冻（6004/11102）只写 modelCooldowns、不写账号级 until，而
+// pickEarliestExpiryLocked 的候选只看 expiry。于是「账号级冷却残留 + 该模型冷冻」的
+// 号会被兜底选中，集中打一次必然失败的请求。v1.16.5 起账号级冷却不再清模型冷冻，
+// 这个组合从罕见变成常见，所以必须在兜底这一层也挡住。
+//
+// 注意：必须让账号另有**非零 expiry**才会进入兜底候选。只挂模型冷冻时 expiry 为空，
+// 旧代码同样不选——那种写法测出来是假绿。
+func TestFallbackHonorsModelCooldown(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	// 账号级软冷却：expiry 非零 → 唯一账号进入兜底候选。
+	p.Cooldown("u1", CoolSoft, 10*time.Minute, "429 rate limit")
+	// 同一账号该模型被上游锁到 30 分钟后。
+	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(30*time.Minute), "kimi-k3.1-pro", "6004")
+
+	if got := p.PickExcludingForModel(nil, "kimi-k3.1-pro"); got != nil {
+		t.Fatalf("兜底绕过了模型级冷冻，会打一次必然失败的请求: %+v", got)
+	}
+	// 其他模型不受牵连：兜底照常选中（账号级冷却中最先到期的那个）。
+	if got := p.PickExcludingForModel(nil, "deepseek-v4.1-flash"); got == nil || got.UID != "u1" {
+		t.Fatalf("模型冷冻不得外溢成整号不可兜底, got %+v", got)
+	}
+}
+
+func TestAccountCooldownKeepsModelFreeze(t *testing.T) {
 	withNoPickGap(t)
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
@@ -1001,18 +1055,24 @@ func TestSoftRateModelClearedByPlainCooldown(t *testing.T) {
 	p.SetCredits("u2", 1, 0)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 
-	// 1) 6004 带解析时间 → 记录模型 glm-5.3。
+	// 1) 6004 带上游重置时间 → 只锁 (u1, glm-5.3)，其他模型仍可选到 u1。
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
 	if got := p.PickExcludingForModel(nil, "hy3-x"); got == nil || got.UID != "u1" {
-		t.Fatalf("precondition: different-model should bypass, got %+v", got)
+		t.Fatalf("precondition: 其他模型应可选到 u1, got %+v", got)
 	}
-	// 2) 账号恢复后经历普通账号级软冷却（无模型语义）。
-	p.NoteSuccess("u1") // 还原 fresh 状态（Cooldown 会重设 until）
+	// 2) u1 再吃一次账号级软冷却：期间整号不可选（换模型也不行）。
 	p.Cooldown("u1", CoolSoft, time.Minute, "429 rate limit")
-	// 3) 换模型请求不得再豁免（softRateModel 已清空）。
-	got := p.PickExcludingForModel(nil, "hy3-x")
-	if got == nil || got.UID != "u2" {
-		t.Fatalf("plain cooldown must clear softRateModel (no bypass), got %+v", got)
+	if got := p.PickExcludingForModel(nil, "hy3-x"); got == nil || got.UID != "u2" {
+		t.Fatalf("账号级冷却期间换模型也不得选到 u1, got %+v", got)
+	}
+	// 3) 账号级冷却到期（负时长把 until 推到过去）：模型冷冻必须仍在。
+	p.Cooldown("u1", CoolSoft, -time.Second, "expired sweep")
+	if got := p.PickExcludingForModel(nil, "glm-5.3"); got == nil || got.UID != "u2" {
+		t.Fatalf("6004 模型冷冻被账号级冷却清掉了（解冻后会立刻再撞同一模型）, got %+v", got)
+	}
+	// 4) 其他模型照常可选：冷冻的只有 glm-5.3，不外溢成整号冷却。
+	if got := p.PickExcludingForModel(nil, "hy3-x"); got == nil || got.UID != "u1" {
+		t.Fatalf("模型冷冻不得外溢成整号冷却, got %+v", got)
 	}
 }
 
@@ -1497,6 +1557,21 @@ func TestPickSkipsInFlightFull(t *testing.T) {
 	p.Release("full")
 }
 
+func TestPickStickyDistinguishesBusyFromUnusable(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlight(1)
+	p.Acquire("u1")
+	if a, why := p.PickStickyForModel("u1", "m"); a != nil || why != StickyBusy {
+		t.Fatalf("full sticky = (%v, %v), want (nil, StickyBusy)", a, why)
+	}
+	p.Release("u1")
+	p.Cooldown("u1", CoolSoft, time.Minute, "test")
+	if a, why := p.PickStickyForModel("u1", "m"); a != nil || why != StickyUnusable {
+		t.Fatalf("cooling sticky = (%v, %v), want (nil, StickyUnusable)", a, why)
+	}
+}
+
 func TestInFlightCountNotExceedLimit(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
@@ -1818,18 +1893,25 @@ func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 	p.SetCreditsDetailed("b", 100, 100, 0, time.Time{}, 0)
 
 	p.mu.Lock()
-	we := p.routingWeightOf(p.byUID["a"], 100, now)
-	wn := p.routingWeightOf(p.byUID["b"], 100, now)
+	rank := p.expiringRankLocked(now, p.expiringWindowLocked(now, ""), "")
 	p.mu.Unlock()
-	if we != wn*expiringVirtualSlots {
-		t.Fatalf("enabled expiring weight=%v want %v", we, wn*expiringVirtualSlots)
+	if rank["a"] != 1 || rank["b"] != 0 {
+		t.Fatalf("rank=%v want a=1（窗口内唯一快过期号）b=0", rank)
+	}
+
+	p.mu.Lock()
+	we := p.routingWeightOf(p.byUID["a"], 100, now, rank["a"])
+	wn := p.routingWeightOf(p.byUID["b"], 100, now, rank["b"])
+	p.mu.Unlock()
+	if we != wn*expiringLadder[0] {
+		t.Fatalf("enabled expiring weight=%v want %v（第 1 名 ×%v）", we, wn*expiringLadder[0], expiringLadder[0])
 	}
 
 	p.SetPreferExpiring(false)
 
 	p.mu.Lock()
-	wa := p.routingWeightOf(p.byUID["a"], 100, now)
-	wb := p.routingWeightOf(p.byUID["b"], 100, now)
+	wa := p.routingWeightOf(p.byUID["a"], 100, now, rank["a"])
+	wb := p.routingWeightOf(p.byUID["b"], 100, now, rank["b"])
 	p.mu.Unlock()
 	if wa != wb {
 		t.Fatalf("disabled expiring weights differ: %v/%v", wa, wb)

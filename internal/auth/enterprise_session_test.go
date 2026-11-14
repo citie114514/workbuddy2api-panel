@@ -6,25 +6,25 @@ import (
 )
 
 // mustJWT 用给定 payload 拼一个最小 JWT（header.payload.signature）。
-// IsEnterpriseSession 不校验签名，只解 payload，故签名段可为任意占位。
+// 构造带指定声明的 JWT，用于确认 token_source 不再影响企业门控。
 func mustJWT(t *testing.T, payload string) string {
 	t.Helper()
 	return "hdr." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".sig"
 }
 
-// TestIsEnterpriseSession 企业切换会话判定：JWT token_source=enterprise_switch
-// 视为企业上下文；无该声明 / 非 JWT / 空 token 一律否（老凭证零回归）；
-// enterpriseId 非空短路为真（与 IsEnterprise 同口径）。
+// TestIsEnterpriseSession 只按 enterpriseId 识别企业账号。
+// enterprise_switch 可出现在未绑定企业租户的个人账号上，不应据此门控成长任务。
 func TestIsEnterpriseSession(t *testing.T) {
 	cases := []struct {
 		name  string
 		token string
 		want  bool
 	}{
-		{"enterprise_switch", mustJWT(t, `{"sub":"u1","token_source":"enterprise_switch"}`), true},
+		{"enterprise_switch 未绑定租户", mustJWT(t, `{"sub":"u1","token_source":"enterprise_switch"}`), false},
+		{"enterprise_switch 的 JWT 租户声明不替代 auth 字段", mustJWT(t, `{"sub":"u1","token_source":"enterprise_switch","enterprise_id":"e9"}`), false},
 		{"无 token_source 声明", mustJWT(t, `{"sub":"u1","scope":"openid profile"}`), false},
 		{"其他 token_source", mustJWT(t, `{"sub":"u1","token_source":"password"}`), false},
-		{"带填充 base64url", "hdr." + base64.URLEncoding.EncodeToString([]byte(`{"token_source":"enterprise_switch"}`)) + ".sig", true},
+		{"带填充 base64url", "hdr." + base64.URLEncoding.EncodeToString([]byte(`{"token_source":"enterprise_switch"}`)) + ".sig", false},
 		{"payload 非 JSON", "hdr." + base64.RawURLEncoding.EncodeToString([]byte("not-json")) + ".sig", false},
 		{"非 JWT 形态", "opaque-token", false},
 		{"空 token", "", false},

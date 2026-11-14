@@ -11,7 +11,6 @@ package session
 
 import (
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"log"
 	"strings"
@@ -41,6 +40,9 @@ type Config struct {
 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
 	// 校验，会话会被钉在这个号上反复失败——正是"限额后换不动号"的观感来源。
 	AvailableForModel func(model string) []string
+	// StickyUsable 校验已有绑定，不看在途名额；AvailableForModel 仍用于新会话分配。
+	// nil 时回落 AvailableForModel，保留旧调用方语义。
+	StickyUsable func(uid, model string) bool
 }
 
 // Router 会话粘性路由器。
@@ -141,11 +143,10 @@ func (r *Router) Resolve(key string) (string, bool) {
 // 有序账号池策略用它保留粘性，未绑定会话由 Pool 选号并在成功后 Bind。
 func (r *Router) LookupForModel(key, model string) (string, bool) {
 	now := time.Now()
-	available := r.availableSet(model)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, found := r.entries[key]
-	if !found || expired(e, now, r.cfg.TTL) || !available[e.uid] {
+	if !found || expired(e, now, r.cfg.TTL) || !r.stickyOK(e.uid, model) {
 		return "", false
 	}
 	r.entries[key] = entry{uid: e.uid, lastActive: now}
@@ -162,18 +163,18 @@ func (r *Router) LookupForModel(key, model string) (string, bool) {
 // 可用性校验，会话会被钉在一个"对当前模型不可用"的号上反复失败。
 func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	now := time.Now()
-	available := r.availableSet(model)
 
 	// ── Fast path: RLock 快查 ──────────────────────────────
 	r.mu.RLock()
 	e, found := r.entries[key]
 	r.mu.RUnlock()
 	if found && !expired(e, now, r.cfg.TTL) {
-		if available[e.uid] {
-			r.touch(key, e.uid, now)
+		// stickyOK 通过后仍需 touch 的 CAS 确认：绑定可能在上面的 RUnlock 之后已被
+		// 别的路径改写（见 touch 注释）。CAS 失败即落到慢路径重新解析。
+		if r.stickyOK(e.uid, model) && r.touch(key, e.uid, now) {
 			return e.uid, true
 		}
-		// 绑定号已冷却/占满 → 失效，落入慢路径重分配。
+		// 绑定号持久失效才重分配；在途满载由 StickyUsable 排除在失效判据之外。
 	}
 
 	// ── Slow path: 写锁 re-check 后分配 ────────────────────
@@ -182,7 +183,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 
 	// re-check：并发同 key 可能已被其他 goroutine 分配好。
 	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, r.cfg.TTL) {
-		if available[e2.uid] {
+		if r.stickyOK(e2.uid, model) {
 			r.entries[key] = entry{uid: e2.uid, lastActive: now}
 			return e2.uid, true
 		}
@@ -221,11 +222,25 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 }
 
 // touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
-func (r *Router) touch(key, uid string, now time.Time) {
+//
+// CAS 语义：写锁内先核对绑定仍是入参 uid 才滚动。快路径从 RUnlock 到加写锁的窗口里，
+// 同一 key 可能已被失败路径 Unbind（解绑）、成功路径 Bind（粘性跟随最终成功号）或慢路径
+// 重分配改写过——无条件回写会把刚解绑的失败号复活、把跟随成功的号冲回旧号，并经
+// SetBind 镜像进 redisstore，连重启都恢复成错误绑定。
+//
+// 返回 false = 绑定已被别的路径改写，本次放弃（以先落地的显式操作为准）；调用方据此
+// 回落到慢路径重新解析，而不是返回一个刚被作废的 uid。
+func (r *Router) touch(key, uid string, now time.Time) bool {
 	r.mu.Lock()
+	e, found := r.entries[key]
+	if !found || e.uid != uid {
+		r.mu.Unlock()
+		return false
+	}
 	r.entries[key] = entry{uid: uid, lastActive: now}
 	r.mu.Unlock()
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	return true
 }
 
 // Bind 显式把会话 key 绑定到 uid（幂等覆盖旧值），并异步镜像到 redisstore。
@@ -280,6 +295,17 @@ func (r *Router) gcOnce(now time.Time) int {
 		r.cfg.Store.DelBind(key)
 	}
 	return len(expiredKeys)
+}
+
+// stickyOK 校验已有绑定；未注入 StickyUsable 时保持旧的可用列表口径。
+func (r *Router) stickyOK(uid, model string) bool {
+	if uid == "" {
+		return false
+	}
+	if r.cfg.StickyUsable != nil {
+		return r.cfg.StickyUsable(uid, model)
+	}
+	return r.availableSet(model)[uid]
 }
 
 // availableSet 把 AvailableForModel(model) 的有序列表转集合（快路径命中校验用）。
@@ -438,7 +464,11 @@ func deriveKey(obj map[string]any) string {
 		return "" // 无用户消息：无从归属会话
 	}
 	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
-	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
+	// 打 UUIDv7 版本位：这个键会派生 X-Conversation-ID（d-<hex> → UUID 形态），
+	// 官方客户端要求 v7（CLI 内核断言），未打点的话版本位是 sha256 的随机一位。
+	// 注意：本键同时是粘性绑定的 key，值变化会让存量绑定重新分配一次（一次性，
+	// 无状态丢失——绑定只是账号偏好）。
+	return derivedKeyPrefix + stampV7(sum[:16])
 }
 
 // userContentSignature 把已解析的 content（any）转回 RawMessage 后取**会话级稳定**

@@ -26,7 +26,11 @@
 //     （详见 reviveCoolingLocked 注释）。
 package pool
 
-import "time"
+import (
+	"sort"
+	"strings"
+	"time"
+)
 
 // clearCoolingLocked 清冷却域：until/coolKind/softStreak/modelCooldowns 全归零，
 // reason 一并清空。熔断器（fails/retryCount/breakerUntil）不属冷却域，不动。
@@ -37,6 +41,49 @@ func (e *entry) clearCoolingLocked() {
 	e.reason = ""
 	e.softStreak = 0
 	e.modelCooldowns = nil // 冷却域清零时一并清模型级独立冷却（模型豁免随之消失）
+}
+
+// isSessionDeadReason 报告禁用原因是否属于「会话失效」（12153）。
+//
+// 只认这一类：11140「account restricted」是上游对账号的显式限制（需申诉），手动禁用是
+// 运维意图，两者都不该被自动探测恢复——前者反复撞只会加深风控印象，后者会推翻人的决定。
+func isSessionDeadReason(reason string) bool {
+	return strings.Contains(strings.ToLower(reason), "session dead")
+}
+
+// SessionDeadCandidates 返回「因会话失效被禁用、且距上次尝试超过 minAge」的账号 UID。
+//
+// disabledAt 为零值（旧状态文件没有该字段）时**不立即返回**，而是从此刻开始计时：
+// 否则升级后第一次刷新会把历史上所有被禁用的号一起打一遍上游。
+func (p *Pool) SessionDeadCandidates(now time.Time, minAge time.Duration) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var out []string
+	for uid, e := range p.byUID {
+		if !e.disabled || !isSessionDeadReason(e.reason) {
+			continue
+		}
+		if e.disabledAt.IsZero() {
+			e.disabledAt = now
+			p.dirty.Store(true)
+			continue
+		}
+		if now.Sub(e.disabledAt) >= minAge {
+			out = append(out, uid)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// TouchDisabledAt 把禁用时间推到现在：复核失败后延后下一次尝试。
+func (p *Pool) TouchDisabledAt(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok && e.disabled {
+		e.disabledAt = time.Now()
+		p.dirty.Store(true)
+	}
 }
 
 // disableLocked 禁用迁移：置 disabled 并清冷却域（禁用是比冷却更强的不可用终态）。
@@ -51,7 +98,8 @@ func (e *entry) clearCoolingLocked() {
 func (p *Pool) disableLocked(e *entry, reason string) {
 	e.clearCoolingLocked()
 	e.disabled = true
-	e.paused = false // 禁用是比暂停更强的终态，二者不叠加（禁用后须 revive 才能复用）
+	e.disabledAt = time.Now() // 自动复核的节流起点
+	e.paused = false          // 禁用是比暂停更强的终态，二者不叠加（禁用后须 revive 才能复用）
 	e.reason = reason
 	p.dirty.Store(true)
 }

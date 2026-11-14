@@ -4,6 +4,7 @@ package upstream
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -43,7 +44,9 @@ const (
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
 	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
-	ErrUpstreamBusy                  // 6021「queue.full.title」渠道级容量满载（非账号问题）→ 不罚号、不轮转，末端 503 + upstream_busy
+	ErrModelBusy                     // 14003 模型容量繁忙 → (账号,模型) 短窗口避让，保留粘性
+	ErrUpstreamBusy                  // 6020/6021 渠道级容量满载（非账号问题）→ 不罚号、不轮转，末端 503 + Retry-After
+	ErrToolSequence                  // 11148 tool_call_sequence_broken：工具调用与结果配对损坏 → 请求级错误，不罚号、不轮转，400 透传原文
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -71,8 +74,12 @@ func (k ErrKind) String() string {
 		return "prompt_too_long"
 	case ErrImageInvalid:
 		return "image_invalid"
+	case ErrModelBusy:
+		return "model_busy"
 	case ErrUpstreamBusy:
 		return "upstream_busy"
+	case ErrToolSequence:
+		return "tool_sequence"
 	case ErrAccountFault:
 		return "account_fault"
 	case ErrChannelRefused:
@@ -137,6 +144,20 @@ func isQueueFullBody(lower string) bool {
 	return strings.Contains(lower, "queue.full") || strings.Contains(lower, "queue full")
 }
 
+// isToolSequenceBroken 判定 11148 tool_call_sequence_broken（工具调用与结果配对损坏）。
+//
+// 双通道：业务码走 codeMarker（JSON 空白容差，避免 `"code": 11148` 这种带空格形态漏判）；
+// 文案兜底两条上游原文——extError 名 tool_call_sequence_broken，以及
+// "tool calls and tool results do not match"（2026-09-20 实机定位 11148 时记录的原文）。
+// lower 是已转小写的 body。
+func isToolSequenceBroken(lower string) bool {
+	if codeMarker(lower, "11148") {
+		return true
+	}
+	return strings.Contains(lower, "tool_call_sequence_broken") ||
+		strings.Contains(lower, "tool calls and tool results do not match")
+}
+
 // accountFaultMarkers 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
 //
 // 定位：这类错误是**账号本身状态**决定的本机故障，不是请求格式、不是临时限流、
@@ -160,15 +181,19 @@ var accountFaultMarkers = []string{
 // accountRestrictedMsg 是 WorkBuddy 11140 账号限制的正文关键词。
 const accountRestrictedMsg = "request illegal"
 
-// IsAccountRestricted 报告上游 body 是否为 WorkBuddy 的账号级限制（11140
-// "request illegal"）。必须 code + 文案双条件：
+// IsAccountRestricted 报告上游 body 是否为 WorkBuddy 的账号级限制
+// （11140 / 11142 + "request illegal"）。必须 code + 文案双条件：
 //   - 只看文案："request illegal" 也出现在 11128 通道校验失败里（健康账号）；
 //   - 只看 code：11140 也承载模型级限流文案（应归 ErrSoftRate）。
+//
+// 11142 的依据来自官方 classifyErrorDetail：`[11142,{category:"auth",
+// subcategory:"auth_forbidden"}]`，与 11140 同属 auth_forbidden。放进同一判定
+// 而不是按 code 一刀切，是因为它同样可能承载别的文案（11140 的教训）。
 func IsAccountRestricted(body string) bool {
 	if !strings.Contains(strings.ToLower(body), accountRestrictedMsg) {
 		return false
 	}
-	return hasBusinessCode(body, "11140")
+	return hasBusinessCode(body, "11140") || hasBusinessCode(body, "11142")
 }
 
 // isChannelRefused 报告上游 body 是否为 WorkBuddy 的通道校验失败（11128
@@ -248,10 +273,20 @@ var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
 // SoftRateResetLoc 暴露重置时间的固定时区（供测试构造/断言同一时区口径）。
 func SoftRateResetLoc() *time.Location { return softRateResetLoc }
 
-// modelRateLimitCode 明确指向「模型级 429 限流」的业务 code。
-// 上游用它表达"该模型的使用量超限"（code 6004，msg 带「将在 … 重置」），
-// 而不是账号整体被限流——账号健康，只是这个模型此刻被限（issue #31）。
-const modelRateLimitCode = "6004"
+// 模型级限流码族（照官方客户端 codebuddy-lite-wb.mjs 的错误码枚举）：
+//
+//	6001 TPS  每秒 token     6005 RPS 每秒请求
+//	6002 TPM  每分钟 token   6006 RPM 每分钟请求
+//	6003 TPH  每小时 token   6007 RPH 每小时请求
+//	6004 TPD  每日 token     6008 RPD 每日请求
+//
+// 它们全部是**按模型**的限额，不是账号整体被限（issue #31 首次只认出 6004）。
+// 只认 6004 的后果：6001/6002/6003/6005/6006/6007 会落到 status==429 的
+// 账号级兜底，把一个「换个模型就能用」的信号罚成整号软冷却——白扔一个健康号
+// 的全部模型。扩族的依据是官方枚举，不是猜测；现网实测只见过 6000/6004。
+const modelRateLimitCodeFamily = `600[1-8]`
+const modelUsageLimitCode = "6000"
+const modelSwitchModelHint = "切换其他模型"
 
 // softRateResetPatternCN/EN 匹配重置文案（CN「将在 … 重置」/ global 域英文
 // "reset at <固定格式时间>"），捕获中间的时间串。
@@ -262,7 +297,9 @@ const softRateResetPatternEN = `(?i)reset at (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2
 // 分类、每个限流 body 上调用，函数体内 MustCompile 是纯浪费；错误风暴（429
 // 轰炸）时尤甚。模式串均为纯常量。regexp 并发安全（匹配只读），无需额外锁。
 var (
-	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCode + `"?`)
+	// 尾部要求紧跟 , } ] —— 否则 "code":60010 会被当成 6001 命中（Go 的 regexp
+	// 没有 lookahead，只能用「后继分隔符」表达数字边界）。
+	reModelRateLimit  = regexp.MustCompile(`"code"\s*:\s*"?` + modelRateLimitCodeFamily + `"?\s*[,}\]]`)
 	reSoftRateResetCN = regexp.MustCompile(softRateResetPatternCN)
 	reSoftRateResetEN = regexp.MustCompile(softRateResetPatternEN)
 )
@@ -270,11 +307,105 @@ var (
 // softRateTimeLayout 上游重置时间的格式（无时区后缀；时区固定 UTC+8）。
 const softRateTimeLayout = "2006-01-02 15:04:05"
 
-// IsModelRateLimit 报告 429 body 是否明确指向模型级限流（业务 code 6004）。
-// 用于区分"账号级软限流"（按账号冷却）与"模型级用量限流"（切模型即可用）。
+// IsModelRateLimit 报告 429 body 是否明确指向模型级限流。
+// 6001–6008 全族始终为模型级；6000 必须同时含"切换其他模型"提示，否则仍为账号级
+// （6000 是 Craft 总限额，缺提示时可能表达的是账号级用量）。
 func IsModelRateLimit(body string) bool {
-	// `"code":6004` / `"code": 6004` / `"code":"6004"` 均可命中（JSON 空格容差）。
-	return reModelRateLimit.MatchString(body)
+	return reModelRateLimit.MatchString(body) ||
+		(hasBusinessCode(body, modelUsageLimitCode) && strings.Contains(body, modelSwitchModelHint))
+}
+
+// ModelRateLimitCode 取 body 里命中的模型级限流码（6001–6008 / 带提示的 6000），
+// 取不到返回 0。用于给冷却台账写上**实际**码而不是恒写 6004——reason 是面板与
+// quota 判定（isQuotaReason）的唯一依据，写错码会把瞬时速率限流误判成日配额。
+func ModelRateLimitCode(body string) int {
+	code := BusinessCode([]byte(body))
+	if code >= 6001 && code <= 6008 {
+		return code
+	}
+	if code == 6000 && strings.Contains(body, modelSwitchModelHint) {
+		return code
+	}
+	return 0
+}
+
+// IsModelBusy 报告上游是否明确返回 14003 模型容量繁忙。
+// 只认结构化业务码，避免 requestId 等字段中的数字造成误判；6004 仍保持模型限流语义。
+func IsModelBusy(body string) bool { return hasBusinessCode(body, "14003") }
+
+// IsModelUnavailable 判定 11134「模型提供方暂时不可用」。
+//
+// 与 14003（模型容量繁忙）同属 (账号, 模型) 侧的暂时性窗口：同一个模型换任何账号
+// 都会撞上，账号本身健康。此前它按 HTTP 5xx 归到 ErrServer，会计入熔断（阈值 3），
+// 于是上游某个模型提供方抖一下，就会把一批健康账号熔断出池。
+func IsModelUnavailable(body string) bool { return hasBusinessCode(body, "11134") }
+
+// queueFields 6020/6021 回应体里的排队信息。
+type queueFields struct {
+	Position   int
+	RetryAfter time.Duration
+	HasPos     bool
+	HasRetry   bool
+}
+
+// parseQueueFields 从 6020/6021 回应体里取 queue_position / retry_after。
+//
+// 官方客户端有两处读法：渲染层直接读错误数据，主进程先取 data、再看 data.data。
+// 这里按「顶层 → data → data.data」依次下钻，两处都能覆盖。
+// 字段值可能是数字，也可能是纯数字字符串（官方按 JS 乘法取值，两种都认）。
+func parseQueueFields(body string) queueFields {
+	var out queueFields
+	var root map[string]any
+	if json.Unmarshal([]byte(body), &root) != nil {
+		return out
+	}
+	node := root
+	for depth := 0; node != nil && depth < 3; depth++ {
+		if v, ok := queueNumber(node["queue_position"]); ok {
+			out.Position, out.HasPos = int(v), true
+		}
+		if v, ok := queueNumber(node["retry_after"]); ok {
+			out.RetryAfter, out.HasRetry = time.Duration(v*float64(time.Second)), true
+		}
+		if out.HasPos && out.HasRetry {
+			break
+		}
+		node, _ = node["data"].(map[string]any)
+	}
+	return out
+}
+
+// queueNumber 取非负数值：JSON number 或纯数字字符串。
+func queueNumber(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, n >= 0
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		return f, err == nil && f >= 0
+	}
+	return 0, false
+}
+
+// QueueRetryAfter 解析 6020/6021 回应体的 retry_after（秒）。
+// 缺失、非正数、非 JSON 或超过 10 分钟的异常值均返回 0，由调用方使用默认短等待。
+func QueueRetryAfter(body string) time.Duration {
+	f := parseQueueFields(body)
+	if !f.HasRetry || f.RetryAfter <= 0 || f.RetryAfter > 10*time.Minute {
+		return 0
+	}
+	return f.RetryAfter
+}
+
+// QueuePosition 解析 6020 回应体里的排位；没给返回 -1。
+// 用途是**观测**：把它写进请求日志，积累「6020 时队列有多长、retry_after 多大」，
+// 才能判断网关内排队（官方查 /v2/chat/queue/status 到号重发）是否值得做。
+func QueuePosition(body string) int {
+	f := parseQueueFields(body)
+	if !f.HasPos || f.Position < 0 {
+		return -1
+	}
+	return f.Position
 }
 
 // modelBlockCode 明确指向「该后端无此模型」的业务 code。
@@ -410,6 +541,12 @@ func hasBusinessEnvelope(body string) bool {
 // 403 含 accountFault 文案的维持现状（ErrAccountFault），由 Classify 的规则序保证。
 func IsWafBlocked(status int, body string) bool {
 	return status == http.StatusForbidden && !hasBusinessEnvelope(body)
+}
+
+// IsGatewayUnauthorized 报告 401 是否来自边缘网关而非业务层。
+// 裸 HTML、空体和纯文本没有可靠的业务判词，需要再通过 refresh 求证。
+func IsGatewayUnauthorized(status int, body string) bool {
+	return status == http.StatusUnauthorized && !hasBusinessEnvelope(body)
 }
 
 // retryAfterHeaderCandidates 冷却时长优先解析的响应头候选序列：
@@ -562,6 +699,10 @@ func ParseRateReset(body string) (time.Time, bool) {
 //     拦截形态。判在通用 4xx 兜底**之前**：此前该形态落 ErrClient → 只换号不罚 →
 //     连环 403。带业务信封的 403 已被上方各层捕获，走不到本层。
 //  12. 内容策略/参数错误/其他 4xx —— 通用兜底。
+//
+// 官方码表（officialCodeKind）排在 sessionDead / accountFault 文案判定之后、
+// 模型繁忙之前：它按业务码给确定性分类，优先级必须高于 `status==429` 这类
+// 只看传输状态的兜底。
 func Classify(status int, body string) ErrKind {
 	// 11102「该后端无此模型」须最先判：它是「模型在后端不存在」的确定性答复，语义比
 	// 计费/限流都更具体——若不先判，msg 里的 "service info not found" 会被更宽的
@@ -600,19 +741,26 @@ func Classify(status int, body string) ErrKind {
 			return ErrAccountFault
 		}
 	}
-	// 14018 是明确的账号积分耗尽业务码。它必须先于通用 429 兜底，否则会被误判为
-	// 可自愈的软限流并在全池冷却时反复兜底选中（issue #175）。仅按结构化 code
-	// 判定；无该 code 的 "credits exhausted" 文案仍保持普通 429 的软限流语义。
-	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
-		return ErrHardCredit
+	// 官方码表的确定性语义：额度耗尽 / 账号状态类业务码，先于通用 429 兜底。
+	//
+	// 429 只是**传输层状态**，同一个 429 背后的业务码可能意味着三件完全不同的事：
+	// 额度用完（弃号等签到恢复）、授权过期（重试永远没用）、或者只是软限流（等几分钟）。
+	// 若不按码分流，全部会落到下面的 `status==429 → ErrSoftRate`：
+	//   - 额度耗尽被白等 10 分钟再失败；
+	//   - 授权过期 → 冷却 → 恢复 → 再失败 → 无限循环，且日志里看不出原因。
+	if kind := officialCodeKind(body); kind != ErrNone {
+		return kind
 	}
-	// 6021「queue.full.title」是**渠道级容量满载**（上游推理集群排队队列打满），
-	// 不是账号问题：同一时刻换任何账号都会撞同一堵墙。必须先于通用 429 兜底，
-	// 否则会按 ErrSoftRate 逐号软冷却——实测 2 秒内即可把整池健康号全部误杀
-	// 冷却（2026-10-15 实案），且换号白撞放大请求量。429 + 结构化 code 为主判据
-	// （与 14018 同口径）；"queue.full" 固定文案单列为外卡——该文案是上游 i18n
-	// key 原文，语义唯一，非 429 状态码出现同样归本类（防上游换状态码）。
-	if (status == http.StatusTooManyRequests && hasBusinessCode(body, "6021")) || isQueueFullBody(lower) {
+	// 14003 模型容量繁忙 / 11134 模型提供方暂时不可用：都是 (账号,模型) 侧的暂时性
+	// 窗口，不是账号级故障。先按结构化业务码分流，避免落入 5xx 后喂熔断计数
+	// （阈值 3，上游抖一下就会熔掉一批健康号），也避免落入通用 429 后软冷却整号。
+	// 6004 的模型限流语义保持不变。
+	if IsModelBusy(body) || IsModelUnavailable(body) {
+		return ErrModelBusy
+	}
+	// 6020 queue.waiting / 6021 queue.full 是渠道级容量信号，不是账号问题。
+	// 结构化 code 不受 HTTP 状态限制；queue.full 固定文案保留兼容兜底。
+	if hasBusinessCode(body, "6020") || hasBusinessCode(body, "6021") || isQueueFullBody(lower) {
 		return ErrUpstreamBusy
 	}
 	// status==429 先于 hardMarkers：限流响应 body 高频携带 "quota exceeded"/
@@ -650,6 +798,9 @@ func Classify(status int, body string) ErrKind {
 	if status >= 500 {
 		return ErrServer
 	}
+	if IsGatewayUnauthorized(status, body) {
+		return ErrSessionDead
+	}
 	// WAF 403（无业务信封的拦截形态）：判在内容策略/参数错误/通用 4xx 之前——
 	// 这些层只认带文案的 body，WAF 空体/HTML 永远不会命中它们的 marker，
 	// 但落 ErrClient 兜底的代价是「只换号不罚」（连环 403 根因），必须在兜底前分流。
@@ -662,6 +813,13 @@ func Classify(status int, body string) ErrKind {
 	// 11135 业务码走 codeMarker（JSON 空白容差），文案走 invalidImageMarkers。
 	if status == http.StatusBadRequest && codeMarker(lower, "11135") {
 		return ErrImageInvalid
+	}
+	// 11148 tool_call_sequence_broken：assistant 的 tool_calls 与后续 tool 结果对不上
+	// （典型成因是客户端回放历史时改写了配对，见 tool_pairing.go 的修复链）。
+	// 这是确定性的请求级错误——同一 body 换任何账号都是同样的匹配失败，换号只会
+	// 把无效请求放大 MaxRotate 倍打上游，还把健康号喂进连败计数。
+	if status == http.StatusBadRequest && isToolSequenceBroken(lower) {
+		return ErrToolSequence
 	}
 	if status == http.StatusBadRequest {
 		for _, m := range invalidImageMarkers {
@@ -706,7 +864,8 @@ type Client struct {
 
 	// ChatHTTP 聊天 SSE 专用 client：无总时长上限（Timeout=0），首字节由
 	// Transport.ResponseHeaderTimeout 约束，流中空闲由 IdleTimeout 约束。
-	// 与 HTTP 共享同一个 *http.Transport 实例，连接池不重复。
+	// 与 HTTP 共享同一个传输层实例（uidTransport），但**连接池按账号分桶**：
+	// 同账号复用连接，跨账号绝不复用。
 	ChatHTTP *http.Client
 
 	// HeaderTimeout 聊天 SSE 首字节前（响应头）超时；<=0 表示未设置（回落 HTTP.Timeout）。
@@ -742,7 +901,7 @@ type Client struct {
 	UserAgent string
 
 	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + X-IDE-Version）。
-	// 空 = 内置默认（对齐官方 5.5.4 分发包）。
+	// 空 = 内置默认（对齐官方 5.9.2 分发包）。
 	ClientVersion string
 
 	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认（官方内置 CLI 2.137.1）。
@@ -801,11 +960,19 @@ type CreditObserver func(uid string, credits int64)
 // TLS 握手超时 / 短 keepalive 探测 / 失败清池，参数见 transport.go——吸收上游
 // kongjianguan 4 连击实测经验）。
 func New() *Client {
-	tr := newTransport()
+	// 分桶传输层：一个账号一个连接池。共用单个 Transport 会让不同账号的请求
+	// 复用同一条 TCP/TLS 连接（见 uidTransport 注释）。
+	tr := newUIDTransport()
 	c := &Client{
-		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
-		ChatBaseCN:    "https://copilot.tencent.com",
+		HTTP:     &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		ChatHTTP: &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		// ChatBaseCN 取官方桌面端的对话主域 www.workbuddy.cn。copilot.tencent.com
+		// 只是桌面端 NetworkFailover 列表里的**备选**入口——用它发全部 CN 对话是
+		// 可判别的形态差异（官方客户端近一个月运行时日志 network-failover.jsonl 里
+		// 出现过的 origin 只有 workbuddy.cn，copilot 零次）。需要回退时用 cn.chat_base 覆盖。
+		// 注意 BillingBase 保持 www.codebuddy.cn：任务计分按「CLI 指纹在 codebuddy.cn、
+		// 桌面指纹在 chat 域」区分，改这里会连带改掉 CLI 类任务的指纹来源。
+		ChatBaseCN:    "https://www.workbuddy.cn",
 		BillingBaseCN: "https://www.codebuddy.cn",
 		WebBaseCN:     "https://www.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
@@ -814,6 +981,30 @@ func New() *Client {
 	}
 	c.SanitizeFingerprints.Store(true)
 	return c
+}
+
+// SetResponseHeaderTimeout 设置聊天首字节（响应头）上限。
+//
+// 取代早前 main 里对 `Transport.(*http.Transport)` 的类型断言：传输层换成
+// uidTransport 后那个断言会静默失配（首字节上限丢失）。这里同时作用于已有桶与
+// 后续新建的桶。
+func (c *Client) SetResponseHeaderTimeout(d time.Duration) {
+	if c == nil {
+		return
+	}
+	cl := c.ChatHTTP
+	if cl == nil {
+		cl = c.HTTP
+	}
+	if cl == nil {
+		return
+	}
+	switch tr := cl.Transport.(type) {
+	case *uidTransport:
+		tr.SetResponseHeaderTimeout(d)
+	case *http.Transport:
+		tr.ResponseHeaderTimeout = d
+	}
 }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
@@ -910,6 +1101,9 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
+	// 客户端形态默认字段（前缀缓存保留档 / 思考摘要档）：必须放在最后，前面的清洗
+	// 与密钥注入都可能重建 body。
+	body = applyChatDefaults(body)
 	return body
 }
 
@@ -1071,6 +1265,23 @@ func isSessionDead(err error) bool {
 	return errors.As(err, &ue) && ue.Kind == ErrSessionDead
 }
 
+// SessionDeadButUsable 报告「refresh 判死，但账号此刻仍能用」。
+//
+// refresh token 失效与账号不可用是两件事：AT 未过期时上游对话接口照常返回 200。
+// 上游实测（issue #83）：部分账号 refresh 恒回 12153、AT 却还有数周至数月，对话
+// 全 200。把这类号计 session dead，会在连续 3 次保活后永久
+// 禁用一个完全健康的账号——面板一片橙色「疑似登录失效」，对话却秒回。
+//
+// 判据只有一条：AT 是否还能用。不按上游文案判（"Session doesn't have required
+// client" 只是同一次失败的措辞，同一账号重试就变成 "Invalid refresh token"），也不按
+// JWT 的 azp（实测 azp 全是 console，多数 plugin 源 refresh 仍正常）。
+//
+// 只适用于「AT 尚未被上游拒绝」的路径：保活巡检、发请求前的预刷新。chat 路径拿到
+// 上游 401 时 AT 已被拒过，那里 refresh 判死就该计死，不适用本函数。
+func SessionDeadButUsable(a *auth.Auth) bool {
+	return a != nil && !a.NeedsRefresh(0)
+}
+
 // adoptNewerTokensFromDisk 在 refresh 失败后读回 auth 文件：若磁盘 RT 与内存不同
 // （另一进程已刷新并写回），采纳磁盘 token 并返回 true，供调用方重试一次。
 // 读文件失败、解析失败、RT 一致均返回 false（不改内存状态），保持失败语义。
@@ -1208,24 +1419,64 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 // 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128；
 // #119 后 global 出站固定 /v2，该兜底保留——上游对 /v2 是否需要 system 无实测
 // 反证，删了无回滚路径）。
+// gzipRequestBody 按官方 productFeature.RequestBodyGzip 的行为压缩 chat 请求体。
+//
+// 官方 CLI 默认开启（product.json 的 RequestBodyGzip=true），上游对明文与 gzip
+// 两种请求体均可接受。收益主要在上行带宽——长上下文压缩后体积通常降到 1/3~1/5，
+// 首字节时间的传输段收益明显。
+//
+// 压不小就不发压缩体（超过 90% 说明是短请求，压缩只是白花 CPU 并多一层形态差异），
+// 返回 ok=false 表示调用方不需要设 Content-Encoding。
+func gzipRequestBody(body []byte) (out []byte, ok bool) {
+	if len(body) < 512 {
+		return body, false
+	}
+	var buf bytes.Buffer
+	buf.Grow(len(body) / 3)
+	zw, err := gzip.NewWriterLevel(&buf, gzip.DefaultCompression)
+	if err != nil {
+		return body, false
+	}
+	if _, err := zw.Write(body); err != nil {
+		_ = zw.Close()
+		return body, false
+	}
+	if err := zw.Close(); err != nil {
+		return body, false
+	}
+	if buf.Len() >= len(body)*9/10 {
+		return body, false
+	}
+	return buf.Bytes(), true
+}
+
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
+	// 客户端形态的逐条消息元数据与内联行为事件（官方在多轮请求里都带）。
+	prepared = applyChatExtras(prepared, meta)
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
+	// 请求体按官方行为 gzip 压缩（一次压好，换号/换路径复用同一份）。
+	payload, gz := gzipRequestBody(prepared)
 	for _, path := range c.chatPaths(a) {
 		endpoint := c.chatBase(a) + path
-		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(prepared))
+		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(payload))
 		if err != nil {
 			return nil, 0, nil, err
 		}
 		c.ChatHeaders(req, a, clientIP, meta)
+		if gz {
+			// Content-Encoding 必须在 ChatHeaders 之后设：ChatHeaders 只设业务头，
+			// 不碰这个键；放在这里是为了让「是否压缩」与实体字节严格对应。
+			req.Header.Set("Content-Encoding", "gzip")
+		}
 		// 从调用方 ctx 派生：保留取消传播（父 ctx 取消 → 本 ctx 取消），
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
@@ -1847,7 +2098,7 @@ func v3ConfigDomain(a *auth.Auth, chatBase string) string {
 	if u, err := url.Parse(chatBase); err == nil && u.Host != "" {
 		return u.Host
 	}
-	return "copilot.tencent.com"
+	return "www.workbuddy.cn"
 }
 
 // fetchV3ConfigModelMap 拉官方 IDE 配置目录，按模型 id 建能力表。

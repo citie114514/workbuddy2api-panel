@@ -484,3 +484,34 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
 	}
 }
+
+// TestRequestMetricsRecordsUpstreamCode 4xx 时把上游业务错误码记进请求日志。
+//
+// 起因：4xx（如 stop 类型错触发的 11101）在自己日志里查不到具体原因，只能人工去
+// 追响应体。现在 upstream_code 直接落档；只记数字码、不记 msg，
+// 保持 reqlog「不写响应正文」的既有约定。
+func TestRequestMetricsRecordsUpstreamCode(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 400, `{"code":11101,"msg":"Unmarshal chat params failed with error: ...","requestId":"x"}`, false
+	})
+	reqLog := reqlog.New(reqlog.Config{})
+	h := NewHandler(Config{
+		Pool:       testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:   up,
+		RequestLog: reqLog,
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	s := reqLog.Snapshot()
+	if len(s.Recent) != 1 {
+		t.Fatalf("metrics = %+v", s)
+	}
+	e := s.Recent[0]
+	if e.Status != http.StatusBadRequest || e.UpstreamCode != 11101 {
+		t.Fatalf("event = %+v（want status=400 upstream_code=11101）", e)
+	}
+}

@@ -413,8 +413,10 @@ function renderAccounts(list) {
       : (s.credits_total > 0
         ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
         : Math.round((s.credits || 0) / maxCred * 100));
-    // 成本台账 tooltip（model_costs）：每模型实测单价（≤0 = 实测免费），运维据此
-    // 看「为什么总选它」——免费号垄断 / 单价排序一眼可见。
+    // 成本台账 tooltip（model_costs）：每模型实测单价，运维据此看「为什么总选它」
+    // ——免费号垄断 / 单价排序一眼可见。判「免费/收费」用 last_per_1k（最近一次原始
+    // 观测，与选号判层同源）；EMA（cost_per_1k）只作残值旁证附在后面，避免面板
+    // 显示与选号口径打架。旧台账没有 last_per_1k 时回退 EMA。
     let credTip;
     if (unlimited) credTip = '企业版不限量（上游 limitNum=-1）';
     else if (s.credits_total > 0) {
@@ -423,8 +425,13 @@ function renderAccounts(list) {
     } else credTip = '积分（相对池内最高）';
     const costs = (s.model_costs || []).filter(c => c.model);
     if (costs.length) {
-      credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
-        '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
+      credTip += '\n实测单价（credits/1K）：\n' + costs.map(c => {
+        const last = (c.last_per_1k === undefined || c.last_per_1k === null)
+          ? c.cost_per_1k : c.last_per_1k;
+        const tail = (c.last_per_1k === undefined || c.last_per_1k === null)
+          ? '' : '（EMA ' + c.cost_per_1k + '）';
+        return '  ' + c.model + '：' + (last <= 0 ? '免费' : last) + tail;
+      }).join('\n');
     }
     const frozen = s.disabled || cool > 0;
     const tu = s.token_usage || {};
@@ -532,7 +539,14 @@ async function loadOverview(quiet) {
     // 「检查」之后卡片永远停在那一刻的旧数据。
     const liveFresh = lastPackages && (Date.now() - lastPackagesAt) < EXP_FRESH_MS;
     if ($('expBox') && !liveFresh) renderExpirySnapshot(d);
-  } catch (e) { if (!quiet) toast(e.message, 'err'); }
+  } catch (e) {
+    // 自动轮询的网络错误保持静默，渲染错误必须留痕，避免表格空白却无诊断信息。
+    if (e && (e instanceof ReferenceError || e.name === 'TypeError')) {
+      console.error('[panel] 渲染异常', e);
+    } else if (!quiet) {
+      toast(e.message, 'err');
+    }
+  }
 }
 
 $('accBody').addEventListener('click', async ev => {
@@ -1136,8 +1150,12 @@ const CFG_MAP = {
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
+  keepalive_refresh_window: ['schedule', 'keepalive_refresh_window'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
+  balance_refresh_jitter_permill: ['schedule', 'balance_refresh_jitter_permill'],
   task_sweep_enabled: ['schedule', 'task_sweep_enabled'], task_sweep_minutes: ['schedule', 'task_sweep_minutes'],
+  task_sweep_jitter_permill: ['schedule', 'task_sweep_jitter_permill'],
+  night_account_cap: ['schedule', 'night_account_cap'],
   include_disabled_in_tasks: ['schedule', 'include_disabled_in_tasks'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   breaker_threshold: ['pool', 'breaker_threshold'],
@@ -1221,7 +1239,8 @@ function collectConfig() {
    不再等到保存被拒。 */
 const DURATION_RE = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
 const DURATION_FIELDS = ['soft_rate', 'soft_rate_max', 'breaker_cooldown', 'breaker_cooldown_max',
-  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl'];
+  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl',
+  'keepalive_refresh_window'];
 const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';
 function durationBad(name) {
   const el = $('cfgForm').elements[name];
@@ -1594,6 +1613,11 @@ const AUTO_TASKS = {
   'Hp_Appearance': '设置主题 API + 皮肤生效事件（两账号实测点亮）',
   'black_cat': '夜猫子：23:00–08:00 窗口内 glm-5.2 对话补足（窗口外提示等 23 点排程）',
   'Expert_lighthouse': '真实轻量云专家召唤+使用链（真实对话 requestId，两账号实测点亮）',
+  'WorkBuddy_Valorant': '真实「无畏契约拼豆专家」召唤+使用链（真实对话 requestId，截止 11-15）',
+  'expert_use_maidehao': '「中国电商运营专家」召唤+使用链（专家页口径，截止 11-20，+50 分）',
+  'expert_use_douyinyin': '「抖音策略师」召唤+使用链（专家页口径，截止 11-20，+50 分）',
+  'expert_use_shangjia_xuanchuan': '「商家宣传页与海报设计师」召唤+使用链（专家页口径，截止 11-20，+50 分）',
+  'expert_use_bowangwang': '「直播电商教练」召唤+使用链（专家页口径，截止 11-20，+50 分）',
   'skill_1': '真实对话 + skill_info 技能加载事件（实测点亮）',
   'school_season': '校园日（小程序口径）：accept → mini 对话+activityId 上报 → 领奖（+100c+5e）',
   'Sequential_Tasks_1': '小程序首对话（小程序口径）：accept → mini 对话上报 → 领奖（+100c+5e）',
@@ -3436,3 +3460,51 @@ if ($('btnExpFold')) {
   };
 }
 applyExpFold();
+
+// ── 运行日志页：三个区块各自折叠 ────────────────────────────────────
+// 请求记录 / 运行日志 / 积分历史 串在一页，展开时一屏放不下，移动端要滚很久。
+// 交互：点标题栏左侧三角，或直接点标题文字（移动端不用精确点中小图标）。
+// 记忆：localStorage 存每块状态；**没有记忆过**时按视口给默认——窄屏收起两张长表、
+// 日志保持展开（最常看），宽屏全部展开保持原样。用户手动切过之后就完全按用户的来。
+const LS_LOGS_FOLD = 'wb2api.logs.fold';
+function logsFoldMap() {
+  try { return JSON.parse(localStorage.getItem(LS_LOGS_FOLD) || '{}') || {}; } catch (e) { return {}; }
+}
+function saveLogsFold(k, v) {
+  const m = logsFoldMap();
+  m[k] = v;
+  try { localStorage.setItem(LS_LOGS_FOLD, JSON.stringify(m)); } catch (e) {}
+}
+function applyLogsFold() {
+  const saved = logsFoldMap();
+  const narrow = window.matchMedia('(max-width: 760px)').matches;
+  document.querySelectorAll('#view-logs .box[data-fold]').forEach(box => {
+    const k = box.dataset.fold;
+    const remembered = Object.prototype.hasOwnProperty.call(saved, k);
+    const folded = remembered ? !!saved[k] : (narrow && k !== 'log');
+    box.toggleAttribute('data-folded', folded);
+    const btn = box.querySelector(':scope > header .fold');
+    if (btn) btn.setAttribute('aria-expanded', folded ? 'false' : 'true');
+  });
+}
+// 三角按钮直接绑定：这是最明确的收起来源，不依赖坐标/委托链路。
+document.querySelectorAll('#view-logs .box[data-fold] > header .fold').forEach(btn => {
+  btn.addEventListener('click', ev => {
+    ev.stopPropagation(); // 交给下面委托会重复 toggle，必须掐掉
+    const box = btn.closest('.box[data-fold]');
+    saveLogsFold(box.dataset.fold, !box.hasAttribute('data-folded'));
+    applyLogsFold();
+  });
+});
+// 委托兜底：点标题或标题栏留白也能折（移动端不必精确点中小三角）。
+document.addEventListener('click', ev => {
+  const box = ev.target.closest('#view-logs .box[data-fold]');
+  if (!box) return;
+  const header = box.querySelector(':scope > header');
+  if (!header || !header.contains(ev.target)) return;
+  const foldBtn = ev.target.closest('.fold');
+  if (!foldBtn && ev.target.closest('button, select, input, a')) return;
+  saveLogsFold(box.dataset.fold, !box.hasAttribute('data-folded'));
+  applyLogsFold();
+});
+applyLogsFold();

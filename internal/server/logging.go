@@ -65,6 +65,13 @@ type chatStat struct {
 	cacheHit  int64
 	cacheMiss int64
 	hasCache  bool
+	// upstreamCode 上游业务错误码（仅 4xx/5xx 填充），供请求日志定位失败原因。
+	upstreamCode int
+	// 6020/6021 的排队观测：queuePos = 上游给的排位（-1 = 没给），
+	// queueRetrySec = 上游建议的首次等待秒数。只在 6020/6021 时非零，
+	// 用于回答「这个模型排队到底要等多久」，而不是凭一次 429 猜。
+	queuePos      int
+	queueRetrySec int
 
 	// 调用来源（客户端 IP / User-Agent）。空 = 未采集（logging.request_client_info
 	// 关闭，或非 chat 路径），展示层一律以 "-" 兜底。
@@ -379,7 +386,7 @@ type requestTrace struct {
 	// model 非 chat 路径的模型标识（搜索写 "WorkBuddy搜索工具"）。chat 路径由
 	// chatStat.model 覆盖，二者不会同时生效。
 	model string
-	stat    *chatStat
+	stat  *chatStat
 	// 调用来源，进入 handler 时一次性采集（见 ServeHTTP / captureClientInfo）。
 	clientIP  string
 	userAgent string
@@ -477,6 +484,9 @@ func (t *requestTrace) event(status int) reqlog.Event {
 		e.HasCredit = s.hasCredit
 		e.CacheHitTokens = s.cacheHit
 		e.CacheMissTokens = s.cacheMiss
+		e.UpstreamCode = s.upstreamCode
+		e.QueuePosition = s.queuePos
+		e.QueueRetryAfterSec = s.queueRetrySec
 	}
 	e.ClientIP = t.clientIP
 	e.UserAgent = t.userAgent

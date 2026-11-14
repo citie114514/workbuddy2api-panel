@@ -3,6 +3,7 @@ package upstream
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -12,6 +13,27 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
+
+type errorReader struct{ err error }
+
+func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestStreamReadFailureWritesErrorTerminal(t *testing.T) {
+	readErr := errors.New("forced upstream read failure")
+	rec := httptest.NewRecorder()
+	input := io.MultiReader(strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"), errorReader{readErr})
+	err := Stream(rec, input)
+	if !IsStreamReadError(err) || !errors.Is(err, readErr) {
+		t.Fatalf("err=%v, want wrapped upstream read failure", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"code":"upstream_parse"`) || !strings.Contains(body, "upstream stream interrupted") {
+		t.Fatalf("missing explicit stream error terminal: %q", body)
+	}
+	if n := strings.Count(body, "data: [DONE]"); n != 1 {
+		t.Fatalf("[DONE] count=%d want 1: %q", n, body)
+	}
+}
 
 func TestPrepareBodyForcesStream(t *testing.T) {
 	out := PrepareBodyOpt([]byte(`{"model":"glm-5.2","messages":[]}`), true)
@@ -23,7 +45,10 @@ func TestPrepareBodyForcesStream(t *testing.T) {
 }
 
 func TestPrepareBodyToolChoiceFunctionObject(t *testing.T) {
-	out := PrepareBodyOpt([]byte(`{"tool_choice":{"type":"function","function":{"name":"get_weather"}},"tools":[{"type":"function"}]}`), true)
+	// tools 里放一条**合法**声明：本用例验的是 tool_choice 对象→字符串，tools 只是
+	// 陪衬。原来的夹具是 `{"type":"function"}`（无 name），那形态现在会被
+	// normalizeToolPatterns 丢弃——上游按 tools[N].function.name 校验，缺名整单 400。
+	out := PrepareBodyOpt([]byte(`{"tool_choice":{"type":"function","function":{"name":"get_weather"}},"tools":[{"type":"function","function":{"name":"get_weather"}}]}`), true)
 	var m map[string]any
 	json.Unmarshal(out, &m)
 	if m["tool_choice"] != "get_weather" {

@@ -52,6 +52,20 @@ func TestNoteSessionDeadDisablesAtThird(t *testing.T) {
 	}
 }
 
+func TestNoteSessionDeadWithSharesThreshold(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.NoteSessionDead("u1")
+	p.NoteSessionDeadWith("u1", "gateway 401 refresh rejected")
+	if !p.NoteSessionDeadWith("u1", "gateway 401 refresh rejected") {
+		t.Fatal("两种入口应共用三次禁用阈值")
+	}
+	st, _ := p.Status("u1")
+	if !st.Disabled || st.DisabledReason != "gateway 401 refresh rejected" {
+		t.Fatalf("unexpected status: %+v", st)
+	}
+}
+
 // TestClearSessionDeadResetsCount 中间成功（refresh 成功）清计数，后续从 1 重新计。
 func TestClearSessionDeadResetsCount(t *testing.T) {
 	p := New("")

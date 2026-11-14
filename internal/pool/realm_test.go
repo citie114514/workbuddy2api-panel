@@ -79,7 +79,11 @@ func TestWeightedAvailableUIDsForModelRealm(t *testing.T) {
 	p.SetCreditsDetailed("cn2", 100, 100, 100, now.Add(time.Hour), 100)
 
 	got := p.WeightedAvailableUIDsForModelRealm("glm-5.2", "cn")
-	want := []string{"cn1", "cn2", "cn2", "cn2"}
+	// cn2 是唯一在窗口内的快过期号 → 名次 1 → 出现 expiringLadder[0]（8）次。
+	want := []string{"cn1"}
+	for i := 0; i < int(expiringLadder[0]); i++ {
+		want = append(want, "cn2")
+	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("weighted cn candidates=%v want %v", got, want)
 	}

@@ -271,25 +271,36 @@ func TestMessagesSearchUpstreamErrorShape(t *testing.T) {
 	}
 }
 
-// TestMessagesRouteDoesNotShadowV1Messages 断言搜索端点没有占用 /v1/messages。
-// v1.14.0 起 /v1/messages 由 Anthropic Messages 适配层接管（该路径此前正是
-// 为模型对话保留）：空对象应得到 Anthropic 形态的 400（缺 max_tokens），
-// 且不得打搜索上游。
+// TestMessagesRouteDoesNotShadowV1Messages 断言 /v1/messages 由 Anthropic 对话端点
+// 承接，而不是被联网搜索端点吞掉。
+//
+// 上游原断言是「/v1/messages 返回 404，该路径留给模型对话」——整合分支已经把
+// 模型对话实现出来了，所以契约升级为：无钥匙时返回 Anthropic 形态的 401，
+// 且绝不触达上游（若被搜索端点误接，会先过搜索的 schema 校验而返回 400）。
 func TestMessagesRouteDoesNotShadowV1Messages(t *testing.T) {
 	up := newSearchUpstream(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Error("不得打上游")
 	})
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
-		Upstream: up})
+		Upstream: up, APIKey: "secret"})
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader([]byte(`{}`)))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("POST /v1/messages code=%d want 400（Anthropic 形态校验错误）", rec.Code)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("POST /v1/messages code=%d want 401（由 Anthropic 端点承接）", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), `"type":"error"`) {
-		t.Errorf("body 必须是 Anthropic 错误形状: %s", rec.Body)
+	var out struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("error body must be JSON: %v", err)
+	}
+	if out.Type != "error" || out.Error.Type != "authentication_error" {
+		t.Errorf("envelope=%+v want Anthropic authentication_error", out)
 	}
 }
 

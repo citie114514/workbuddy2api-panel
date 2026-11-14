@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +39,14 @@ func TestClassify(t *testing.T) {
 		{403, `{"code":"11-128","msg":"request illegal"}`, ErrChannelRefused},
 		{400, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
 		{403, `{"code":11140,"msg":"request illegal"}`, ErrAccountFault},
+		// 11148 tool_call_sequence_broken：工具调用与后续 tool 结果配对不上。
+		// 这是确定性的请求级错误——同一 body 换任何账号都是同样的匹配失败，
+		// 误归 ErrClient 会让它消耗轮换预算并把健康号喂进连败计数。
+		{400, `{"code":11148,"msg":"tool calls and tool results do not match"}`, ErrToolSequence},
+		{400, `{"code": 11148,"extError":"tool_call_sequence_broken"}`, ErrToolSequence},
+		{400, `{"code":11148,"msg":"unrelated wording"}`, ErrToolSequence},
+		// 对照：相邻的请求级错误码不能被吞进来。
+		{400, `{"code":11101,"msg":"Unmarshal chat params failed"}`, ErrBadParams},
 		// 无 code 的裸 "request illegal" 不归属任何账号级判定（宁可走通用 4xx 兜底，
 		// 也不能凭一句文案硬禁用账号）。
 		{400, `{"msg":"request illegal"}`, ErrClient},
@@ -111,6 +120,15 @@ func TestClassify(t *testing.T) {
 		{429, `{"error":{"data":{"code":"14018","msg":"Credits exhausted"}}}`, ErrHardCredit},
 		{429, `{"requestId":"14018","msg":"Credits exhausted"}`, ErrSoftRate},
 		{429, `{"code":1,"msg":"Credits exhausted"}`, ErrSoftRate},
+		// 14003 是 (账号,模型) 容量短窗口，不是账号级 429；6020 与 6021
+		// 同属渠道容量信号。只认结构化 code，requestId 撞数字不得误判。
+		{429, `{"code":14003,"msg":"model capacity busy"}`, ErrModelBusy},
+		{503, `{"error":{"data":{"code":"14003","msg":"model capacity busy"}}}`, ErrModelBusy},
+		{429, `{"requestId":"14003","msg":"too many requests"}`, ErrSoftRate},
+		{429, `{"code":6004,"msg":"model rate limit"}`, ErrSoftRate},
+		{429, `{"code":6020,"msg":"queue.waiting"}`, ErrUpstreamBusy},
+		{503, `{"error":{"data":{"code":"6020","msg":"queue.waiting"}}}`, ErrUpstreamBusy},
+		{429, `{"requestId":"6020","msg":"too many requests"}`, ErrSoftRate},
 		// 6021「queue.full.title」渠道级容量满载（2026-10-15 实案）：不是账号问题，
 		// 必须归 ErrUpstreamBusy（不罚号不轮转）——按 ErrSoftRate 逐号软冷却会在
 		// 秒级把整池健康号误杀。结构化 code 与固定文案双判据。
@@ -145,7 +163,7 @@ func TestClassify(t *testing.T) {
 	}
 }
 
-// TestIsModelRateLimit 判断 429 body 是否明确指向模型级限流（code 6004）。
+// TestIsModelRateLimit 判断 429 body 是否明确指向模型级限流（6001–6008 码族 + 带提示的 6000）。
 func TestIsModelRateLimit(t *testing.T) {
 	cases := []struct {
 		body string
@@ -154,6 +172,21 @@ func TestIsModelRateLimit(t *testing.T) {
 		// 6004：模型级限流（issue #31 的核心场景）。
 		{`{"code":6004,"msg":"将在 2026-09-11 18:33:27 UTC+8 重置"}`, true},
 		{`{"code": 6004,"msg":"x"}`, true},
+		{`{"code":6000,"msg":"模型用量已达上限，请切换其他模型"}`, true},
+		{`{"code": "6000", "msg": "请切换其他模型"}`, true},
+		{`{"code":6000,"msg":"model usage limit exceeded"}`, false},
+		// 6001–6008 全族：官方枚举里都是「按模型」的限额，换模型即可用。
+		{`{"code":6001,"msg":"tps limit"}`, true},
+		{`{"code":6002,"msg":"tpm limit"}`, true},
+		{`{"code":6003,"msg":"tph limit"}`, true},
+		{`{"code":6005,"msg":"rps limit"}`, true},
+		{`{"code":6006,"msg":"rpm limit"}`, true},
+		{`{"code":6007,"msg":"rph limit"}`, true},
+		{`{"code":6008,"msg":"rpd limit"}`, true},
+		{`{"code":"6005","msg":"rps limit"}`, true},
+		// 数字边界：60010 不是 6001，不能被子串误命中。
+		{`{"code":60010,"msg":"x"}`, false},
+		{`{"code":16004,"msg":"x"}`, false},
 		// 其他 code（非模型级限流）→ 不算。
 		{`{"code":11140,"msg":"The model provider is rate-limiting requests."}`, false},
 		{`{"code":1,"msg":"429 rate limit"}`, false},
@@ -161,6 +194,28 @@ func TestIsModelRateLimit(t *testing.T) {
 	for _, c := range cases {
 		if got := IsModelRateLimit(c.body); got != c.want {
 			t.Errorf("IsModelRateLimit(%q)=%v want %v", c.body, got, c.want)
+		}
+	}
+}
+
+// TestModelRateLimitCode 取实际命中的码：reason 要写真实码，不能恒写 6004
+// （6004 代表日配额、6001 代表秒级速率，混写会把瞬时窗口锁到次日）。
+func TestModelRateLimitCode(t *testing.T) {
+	cases := []struct {
+		body string
+		want int
+	}{
+		{`{"code":6004,"msg":"x"}`, 6004},
+		{`{"code":6001,"msg":"x"}`, 6001},
+		{`{"code":6008,"msg":"x"}`, 6008},
+		{`{"code":6000,"msg":"请切换其他模型"}`, 6000},
+		{`{"code":6000,"msg":"model usage limit exceeded"}`, 0},
+		{`{"code":11140,"msg":"x"}`, 0},
+		{`not json`, 0},
+	}
+	for _, c := range cases {
+		if got := ModelRateLimitCode(c.body); got != c.want {
+			t.Errorf("ModelRateLimitCode(%q)=%d want %d", c.body, got, c.want)
 		}
 	}
 }
@@ -285,11 +340,16 @@ func TestRefreshSessionDead(t *testing.T) {
 
 func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 	var gotAuth, gotUID, gotProduct string
+	var gotIntent, gotAgentType, gotRuntime, gotPrivate string
 	var gotBody []byte
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		gotAuth = r.Header.Get("Authorization")
 		gotUID = r.Header.Get("X-User-Id")
 		gotProduct = r.Header.Get("X-Product")
+		gotIntent = r.Header.Get("X-Agent-Intent")
+		gotAgentType = r.Header.Get("X-Agent-Type")
+		gotRuntime = r.Header.Get("X-Agent-Runtime")
+		gotPrivate = r.Header.Get("X-Private-Data")
 		gotBody, _ = io.ReadAll(r.Body)
 		return &http.Response{
 			StatusCode: 200,
@@ -306,8 +366,21 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		t.Errorf("200 response should carry nil body, got %q", respBody)
 	}
 	rc.Close()
-	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "WorkBuddy" {
+	// X-Product 恒 "SaaS"：官方桌面端就是这么发的，X-IDE-Name/Type 才是 WorkBuddy。
+	// 此前跟随 ClientName 发 "WorkBuddy"，与同一账号事件上报通道（恒 SaaS）矛盾。
+	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "SaaS" {
 		t.Errorf("headers: auth=%q uid=%q product=%q", gotAuth, gotUID, gotProduct)
+	}
+	// agent 语义头，取值按 CLI 内核：
+	//   X-Agent-Intent=craft、X-Agent-Type=main、X-Agent-Runtime=other（抓官方 CLI 2.165.0 实测值）
+	//   X-Private-Data=**false**——CLI 里是 `A ? "false" : "true"`，A 为「模型优化已启用」，
+	//   product.json 的 DefaultModelOptimizationOff=false → 优化开启 → false。
+	//   原先按「桌面端恒 true」写反了方向。
+	if gotIntent != "craft" || gotAgentType != "main" || gotRuntime != "other" {
+		t.Errorf("agent headers: intent=%q type=%q runtime=%q want craft/main/other", gotIntent, gotAgentType, gotRuntime)
+	}
+	if gotPrivate != "false" {
+		t.Errorf("X-Private-Data=%q want false（模型优化默认开启时 CLI 发 false）", gotPrivate)
 	}
 	if !bytes.Contains(gotBody, []byte(`"stream":true`)) {
 		t.Errorf("stream not forced: %s", gotBody)
@@ -506,16 +579,21 @@ func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
 	if c.ChatHTTP.Timeout != 0 {
 		t.Errorf("ChatHTTP.Timeout=%v want 0 (no total cap)", c.ChatHTTP.Timeout)
 	}
-	// 共享同一个 Transport 实例，连接池不重复。
+	// 共享同一个传输层实例（uidTransport），但连接池按账号分桶：同账号复用、
+	// 跨账号绝不共用同一条 TCP/TLS 连接。
 	if c.ChatHTTP.Transport != c.HTTP.Transport {
-		t.Errorf("ChatHTTP and HTTP must share the same *http.Transport")
+		t.Errorf("ChatHTTP and HTTP must share the same transport layer")
 	}
-	htr, ok := c.ChatHTTP.Transport.(*http.Transport)
+	utr, ok := c.ChatHTTP.Transport.(*uidTransport)
 	if !ok {
-		t.Fatalf("Transport type=%T", c.ChatHTTP.Transport)
+		t.Fatalf("Transport type=%T want *uidTransport", c.ChatHTTP.Transport)
 	}
-	if htr.ResponseHeaderTimeout != 60*time.Second { // 连接层加固：响应头上限从 120s 收到 60s（慢冷启动留 3.75× 余量）
-		t.Errorf("ResponseHeaderTimeout=%v want 60s", htr.ResponseHeaderTimeout)
+	// 分桶里的 Transport 仍带连接层加固参数（响应头上限 60s，慢冷启动留 3.75× 余量）。
+	if got := utr.forUID("probe").ResponseHeaderTimeout; got != 60*time.Second {
+		t.Errorf("ResponseHeaderTimeout=%v want 60s", got)
+	}
+	if utr.forUID("acct-a") == utr.forUID("acct-b") {
+		t.Error("不同账号必须用不同的连接池（否则会共用同一条上游连接）")
 	}
 }
 
@@ -691,5 +769,174 @@ func TestClassifyRealChannelRefusedBody(t *testing.T) {
 	}
 	if got := Classify(403, `{"code":"`+code+`","msg":"request illegal"}`); got != ErrChannelRefused {
 		t.Fatalf("Classify(real 11-128, 403)=%v want ErrChannelRefused", got)
+	}
+}
+
+func TestQueueRetryAfter(t *testing.T) {
+	cases := []struct {
+		body string
+		want time.Duration
+	}{
+		{`{"code":6020,"data":{"retry_after":7}}`, 7 * time.Second},
+		{`{"code":6021,"data":{"retry_after":2.25}}`, 2250 * time.Millisecond},
+		{`{"code":6021,"data":{"retry_after":0}}`, 0},
+		{`{"code":6021,"data":{"retry_after":-1}}`, 0},
+		{`{"code":6021,"data":{"retry_after":601}}`, 0},
+		{`{"code":6021,"data":{}}`, 0},
+		{`not json`, 0},
+		// 官方两处读法不同：渲染层直接读错误数据（顶层），主进程先取 data 再取
+		// data.data。三种位置都必须能读到。
+		{`{"code":6020,"retry_after":7}`, 7 * time.Second},
+		{`{"code":6020,"data":{"data":{"retry_after":7}}}`, 7 * time.Second},
+		{`{"code":6020,"data":{"retry_after":"7"}}`, 7 * time.Second},
+	}
+	for _, tc := range cases {
+		if got := QueueRetryAfter(tc.body); got != tc.want {
+			t.Errorf("QueueRetryAfter(%s)=%v want %v", tc.body, got, tc.want)
+		}
+	}
+}
+
+// TestQueuePosition 排位解析（观测字段）：没给返回 -1，不能用 0 冒充——
+// 0 是「排在第一」，与「上游没说」是两回事，混起来会把观测数据读反。
+func TestQueuePosition(t *testing.T) {
+	cases := []struct {
+		body string
+		want int
+	}{
+		{`{"code":6020,"data":{"queue_position":3,"retry_after":7}}`, 3},
+		{`{"code":6020,"queue_position":0,"retry_after":7}`, 0},
+		{`{"code":6020,"data":{"data":{"queue_position":12}}}`, 12},
+		{`{"code":6020,"data":{"queue_position":"5"}}`, 5},
+		{`{"code":6020,"data":{"retry_after":7}}`, -1},
+		{`{"code":6021,"data":{}}`, -1},
+		{`not json`, -1},
+	}
+	for _, tc := range cases {
+		if got := QueuePosition(tc.body); got != tc.want {
+			t.Errorf("QueuePosition(%s)=%d want %d", tc.body, got, tc.want)
+		}
+	}
+}
+
+func TestFrameKindPreservesCapacityCodes(t *testing.T) {
+	cases := []struct {
+		payload string
+		want    ErrKind
+	}{
+		{`{"error":{"code":14003,"message":"model busy"}}`, ErrModelBusy},
+		{`{"error":{"code":"6020","message":"queue waiting"}}`, ErrUpstreamBusy},
+		{`{"error":{"code":6021,"message":"queue full"}}`, ErrUpstreamBusy},
+		{`{"error":{"code":6004,"message":"model rate limit"}}`, ErrSoftRate},
+	}
+	for _, tc := range cases {
+		if got := FrameKind(tc.payload); got != tc.want {
+			t.Errorf("FrameKind(%s)=%v want %v", tc.payload, got, tc.want)
+		}
+	}
+}
+
+// TestGzipRequestBody 请求体压缩：大体积压且可无损还原，小体积不压。
+//
+// 官方 CLI 的 productFeature.RequestBodyGzip=true，chat 请求体默认 gzip。上游对
+// 明文与 gzip 两种实体均可接受；收益在上行带宽。
+func TestGzipRequestBody(t *testing.T) {
+	// 可压缩的长体（真实 prompt 是自然语言，重复度高）
+	big := bytes.Repeat([]byte(`{"role":"user","content":"请分析这段日志里的错误原因。"},`), 80)
+	out, ok := gzipRequestBody(big)
+	if !ok {
+		t.Fatal("大体积请求体应被压缩")
+	}
+	if len(out) >= len(big)/2 {
+		t.Errorf("压缩比不合理: %d -> %d", len(big), len(out))
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(out))
+	if err != nil {
+		t.Fatalf("解压失败: %v", err)
+	}
+	back, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("读取解压体失败: %v", err)
+	}
+	if !bytes.Equal(back, big) {
+		t.Error("解压后与原文不一致（压缩有损）")
+	}
+
+	// 短体不压（避免白花 CPU 与多一层形态差异）
+	small := []byte(`{"model":"glm-5.2","messages":[]}`)
+	if _, ok := gzipRequestBody(small); ok {
+		t.Error("短请求体不该压缩")
+	}
+	// 不可压缩体（随机噪声）也不该发压缩体
+	rnd := make([]byte, 2048)
+	for i := range rnd {
+		rnd[i] = byte(i * 37 % 251)
+	}
+	if out, ok := gzipRequestBody(rnd); ok && len(out) >= len(rnd)*9/10 {
+		t.Errorf("压不动的体不该发压缩体: %d -> %d", len(rnd), len(out))
+	}
+}
+
+// TestBusinessCode 从上游错误体取业务码：数字/字符串两种都认，取不到给 0。
+func TestBusinessCode(t *testing.T) {
+	cases := []struct {
+		body string
+		want int
+	}{
+		{`{"code":11101,"msg":"bad"}`, 11101},
+		{`{"code":"11128","msg":"channel"}`, 11128},
+		{`{"error":{"code":6004}}`, 6004},
+		{`{"msg":"no code here"}`, 0},
+		{`not json`, 0},
+		{``, 0},
+	}
+	for _, c := range cases {
+		if got := BusinessCode([]byte(c.body)); got != c.want {
+			t.Errorf("BusinessCode(%q) = %d want %d", c.body, got, c.want)
+		}
+	}
+}
+
+// TestGzipRequestBodyUsesDefaultLevel 钉住请求体压缩级别：必须是 gzip 默认级别（6），
+// 不是 BestSpeed(1)。
+//
+// 依据：长上下文（1 MB 级）上 L1 的产物比 L6 大 16%，而 L6 的编码耗时只从 9ms 涨到 23ms
+// （+14ms），相对 2–4s 的 TTFT 可忽略；出站按量计费，多压出来的体积是净省的。
+// 这个断言防的是「为了省 CPU 又把它调回 BestSpeed」的反向优化——那样会静默丢掉 16%。
+func TestGzipRequestBodyUsesDefaultLevel(t *testing.T) {
+	// 半重复文本：既保证可压，又让 L1 与 L6 的产物有可测差异（纯重复样本两级会压成一样）。
+	var sb bytes.Buffer
+	for i := 0; i < 800; i++ {
+		fmt.Fprintf(&sb, "func handler%d(w http.ResponseWriter, r *http.Request) { id := %d; body := \"%d\" }\n", i, i*7919, i*104729)
+	}
+	sample := sb.Bytes()
+
+	got, ok := gzipRequestBody(sample)
+	if !ok {
+		t.Fatal("样本应被压缩")
+	}
+	encode := func(lvl int) []byte {
+		var buf bytes.Buffer
+		zw, err := gzip.NewWriterLevel(&buf, lvl)
+		if err != nil {
+			t.Fatalf("level %d: %v", lvl, err)
+		}
+		if _, err := zw.Write(sample); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		return buf.Bytes()
+	}
+	l1, l6 := encode(gzip.BestSpeed), encode(gzip.DefaultCompression)
+	if bytes.Equal(l1, l6) {
+		t.Skip("样本对 L1/L6 无区分度，换样本才能验证（跳过而非假绿）")
+	}
+	if !bytes.Equal(got, l6) {
+		t.Errorf("压缩级别不是 DefaultCompression：产物与 L6 不一致（len got=%d l6=%d l1=%d）", len(got), len(l6), len(l1))
+	}
+	if bytes.Equal(got, l1) {
+		t.Errorf("压缩级别仍是 BestSpeed(L1)，会丢掉约 16%% 的上行体积")
 	}
 }

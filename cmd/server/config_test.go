@@ -22,6 +22,26 @@ func TestDefault(t *testing.T) {
 	}
 }
 
+func TestTimeoutRotateExtraConfig(t *testing.T) {
+	def, err := ParseConfig([]byte(`{"upstream":{"timeout_seconds":10}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if def.TimeoutRotateExtra != 1 {
+		t.Fatalf("missing timeout_rotate_extra = %d, want 1", def.TimeoutRotateExtra)
+	}
+	off, err := ParseConfig([]byte(`{"timeout_rotate_extra":0}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off.TimeoutRotateExtra != 0 {
+		t.Fatalf("explicit zero = %d, want 0", off.TimeoutRotateExtra)
+	}
+	if _, err := ParseConfig([]byte(`{"timeout_rotate_extra":-1}`)); err == nil {
+		t.Fatal("negative timeout_rotate_extra must be rejected")
+	}
+}
+
 func TestPanelPackageDetailLimit(t *testing.T) {
 	c := Default()
 	if err := c.normalize(); err != nil {
@@ -857,5 +877,83 @@ func TestServerReadTimeout(t *testing.T) {
 	c.Server.ReadTimeout = "bogus"
 	if err := c.normalize(); err == nil {
 		t.Error("unparsable read_timeout should fail fast")
+	}
+}
+
+// TestShutdownTimeoutConfig 优雅关停窗口：缺省 30s；"0" 合法（立即退出）；
+// 负值/非法值 fail fast（静默关掉保护比报错更糟）。
+func TestShutdownTimeoutConfig(t *testing.T) {
+	def := Default()
+	if err := def.normalize(); err != nil {
+		t.Fatalf("normalize default: %v", err)
+	}
+	if def.ServerShutdownTimeoutDur != 30*time.Second {
+		t.Fatalf("默认关停窗口=%v want 30s", def.ServerShutdownTimeoutDur)
+	}
+
+	zero, err := ParseConfig([]byte(`{"server":{"shutdown_timeout":"0"}}`))
+	if err != nil {
+		t.Fatalf("parse zero: %v", err)
+	}
+	if zero.ServerShutdownTimeoutDur != 0 {
+		t.Fatalf("显式 0 应表示立即退出，got %v", zero.ServerShutdownTimeoutDur)
+	}
+
+	custom, err := ParseConfig([]byte(`{"server":{"shutdown_timeout":"90s"}}`))
+	if err != nil {
+		t.Fatalf("parse custom: %v", err)
+	}
+	if custom.ServerShutdownTimeoutDur != 90*time.Second {
+		t.Fatalf("自定义窗口=%v want 90s", custom.ServerShutdownTimeoutDur)
+	}
+
+	if _, err := ParseConfig([]byte(`{"server":{"shutdown_timeout":"-5s"}}`)); err == nil {
+		t.Fatal("负值应报错")
+	}
+	if _, err := ParseConfig([]byte(`{"server":{"shutdown_timeout":"abc"}}`)); err == nil {
+		t.Fatal("非法时长应报错")
+	}
+}
+
+// TestScheduleHumanizeConfig 抖动幅度 0–500，越界报错；夜猫子上限不得为负；
+// 缺省抖动为 200（±20%）——「精确整点打卡」本身就是机器特征，默认值应偏向像人。
+// 夜猫子上限缺省仍为 0（不限）。
+//
+// 注意：0 仍是合法值（旧配置显式写 0 = 不抖动，行为逐字不变），只是不再是缺省。
+func TestScheduleHumanizeConfig(t *testing.T) {
+	def := Default()
+	if err := def.normalize(); err != nil {
+		t.Fatalf("normalize default: %v", err)
+	}
+	if def.Schedule.BalanceRefreshJitterPermill != 200 || def.Schedule.TaskSweepJitterPermill != 200 {
+		t.Fatalf("缺省抖动应为 200（±20%%），got balance=%d sweep=%d",
+			def.Schedule.BalanceRefreshJitterPermill, def.Schedule.TaskSweepJitterPermill)
+	}
+	if def.Schedule.NightAccountCap != 0 {
+		t.Fatalf("夜猫子上限缺省应为 0（不限），got %d", def.Schedule.NightAccountCap)
+	}
+	// 显式写 0 仍等于「不抖动」：老配置不用改。
+	if off, err := ParseConfig([]byte(`{"schedule":{"balance_refresh_jitter_permill":0,"task_sweep_jitter_permill":0}}`)); err != nil {
+		t.Fatalf("显式 0 应可解析: %v", err)
+	} else if off.Schedule.BalanceRefreshJitterPermill != 0 || off.Schedule.TaskSweepJitterPermill != 0 {
+		t.Fatalf("显式 0 未生效: %+v", off.Schedule)
+	}
+
+	ok, err := ParseConfig([]byte(`{"schedule":{"balance_refresh_jitter_permill":300,"task_sweep_jitter_permill":500,"night_account_cap":3}}`))
+	if err != nil {
+		t.Fatalf("parse ok case: %v", err)
+	}
+	if ok.Schedule.BalanceRefreshJitterPermill != 300 || ok.Schedule.TaskSweepJitterPermill != 500 || ok.Schedule.NightAccountCap != 3 {
+		t.Fatalf("解析结果不符: %+v", ok.Schedule)
+	}
+
+	if _, err := ParseConfig([]byte(`{"schedule":{"balance_refresh_jitter_permill":501}}`)); err == nil {
+		t.Fatal("抖动 >500 应报错")
+	}
+	if _, err := ParseConfig([]byte(`{"schedule":{"task_sweep_jitter_permill":-1}}`)); err == nil {
+		t.Fatal("负抖动应报错")
+	}
+	if _, err := ParseConfig([]byte(`{"schedule":{"night_account_cap":-2}}`)); err == nil {
+		t.Fatal("负夜猫子上限应报错")
 	}
 }

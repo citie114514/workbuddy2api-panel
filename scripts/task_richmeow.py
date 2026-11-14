@@ -5,7 +5,7 @@
 搜 RichMeow 相关——未找到专属 eventCode，REPORT §3.2 也标注「桌面端专属（未破）」）。
 
 实测结论（REPORT §3.2，2026-09-11）：
-  - accept 后 3 个账号多次 chat_request_send 上报均不计数（progress 0/1 不动）。
+  - accept 后多个账号多次 chat_request_send 上报均不计数（progress 0/1 不动）。
   - 怀疑是桌面端变体的另一套上报通道：queuePendingGrowthTelemetry → 把 growthEvent
     挂在 chat 请求的 extra_vars 里随请求上行（REPORT §1.1），而非 /v2/report。
   - 本脚本默认上线尝试 1 次 chat_request_send（成本可忽略）；若仍 0/1 → 判为不可脚本化。

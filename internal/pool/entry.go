@@ -84,37 +84,37 @@ type Status struct {
 	// 只有最早一批的旧字段无法表达「同一天多个包」「后续批次」「7 天内合计」。
 	CreditsExpiryBuckets []ExpiryBucket `json:"credits_expiry_buckets,omitempty"`
 	Cooling              bool           `json:"cooling"`
-	CoolKind                 string    `json:"cool_kind,omitempty"`
-	CoolRemaining            int64     `json:"cool_remaining_sec,omitempty"`
-	Until                    time.Time `json:"until,omitempty"`
-	Reason                   string    `json:"reason,omitempty"`
-	SoftStreak               int       `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
+	CoolKind             string         `json:"cool_kind,omitempty"`
+	CoolRemaining        int64          `json:"cool_remaining_sec,omitempty"`
+	Until                time.Time      `json:"until,omitempty"`
+	Reason               string         `json:"reason,omitempty"`
+	SoftStreak           int            `json:"soft_streak,omitempty"` // 连续软冷却次数（指数退避指数，见 entry.softStreak）
 	// RateLimitedModels 当前仍在限额的模型列表（issue #36 限额台账）。
 	// 仅「带解析时间 6004」触发的模型级独立冷却（modelCooldowns 未到期条目）时非空，
 	// 每模型一行；运维据此看到"账号 A 的模型 X 还在限额中，预计 Z 时间恢复"。到期即消失（零回归）。
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
-	Realm           string     `json:"realm,omitempty"`
+	Realm string `json:"realm,omitempty"`
 	// Enterprise 企业版账号（auth.EnterpriseID 非空，计算值不落盘）。
 	// 企业版无个人成长体系（签到/成长任务/连登/旅行/夜猫子 上游均拒），
 	// 面板据此隐藏对应按钮；选号、保活、额度展示不受影响。
-	Enterprise      bool       `json:"enterprise,omitempty"`
-	Disabled        bool       `json:"disabled"`
-	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	Enterprise     bool   `json:"enterprise,omitempty"`
+	Disabled       bool   `json:"disabled"`
+	DisabledReason string `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
 	// Paused 暂停选号：退出选号候选（与 disabled 一样不参与选号），但**照常参与**
 	// 签到 / 活跃上报 / 保活 / 余额刷新四类保号任务。与 disabled 正交——disabled 是
 	// 「授权/session 终态，需人工 revive」，paused 是「运维临时让位」（多号轮换场景），
 	// 账号本身健康，只是暂不接流量。
-	Paused          bool       `json:"paused,omitempty"`
-	SuccessCount    int64      `json:"success_count,omitempty"`
-	ErrTotal        int64      `json:"err_total,omitempty"`
-	LastSuccessTime time.Time  `json:"last_success,omitempty"`
-	LastErrTime     time.Time  `json:"last_err,omitempty"`
+	Paused          bool      `json:"paused,omitempty"`
+	SuccessCount    int64     `json:"success_count,omitempty"`
+	ErrTotal        int64     `json:"err_total,omitempty"`
+	LastSuccessTime time.Time `json:"last_success,omitempty"`
+	LastErrTime     time.Time `json:"last_err,omitempty"`
 	// CheckinDone 本地今日已签到（签到成功或上游"今天已签到"幂等拒绝均算）。
 	// global 域账号无签到体系，恒为 false。面板签到按钮据此显示 签到/已签。
-	CheckinDone bool        `json:"checkin_done,omitempty"`
-	TokenUsage  TokenUsage  `json:"token_usage,omitempty"`
+	CheckinDone bool       `json:"checkin_done,omitempty"`
+	TokenUsage  TokenUsage `json:"token_usage,omitempty"`
 	// ModelCosts 每模型实测成本台账（P1-anti-monopoly 可观测性）：运维据此自查
 	//「为什么总选它」——tier 0（免费）垄断 / tier 2 单价排序一眼可见。
 	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
@@ -132,12 +132,14 @@ type Status struct {
 }
 
 // ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
-// tier 不单独落字段：cost_per_1k ≤ 0 即 tier 0（免费），> 0 即 tier 2（收费），
-// 无观测即 tier 1——由调用方/面板按值推出，避免双表示漂移。
+// tier 不单独落字段：判层依据是 last_per_1k（缺失时回退 cost_per_1k），≤0 即 tier 0
+// （免费）、> 0 即 tier 2（收费），无观测即 tier 1——由调用方/面板按值推出，避免双表示漂移。
 type ModelCostStatus struct {
 	Model string `json:"model"`
-	// CostPer1k 实测每千 token 单价（EMA 平滑值）。≤0 = 实测免费（tier 0）。
+	// CostPer1k 指数平滑单价（EMA）。**已不参与判层**，仅作层内排序与残值旁证。
 	CostPer1k float64 `json:"cost_per_1k"`
+	// LastPer1k 最近一次原始观测单价，判层依据。旧台账缺该字段时省略。
+	LastPer1k *float64 `json:"last_per_1k,omitempty"`
 	// LastSeen 最近一次观测时刻（过期即从台账消失，同 modelCostTTL 口径）。
 	LastSeen time.Time `json:"last_seen"`
 	// Samples 累计观测次数（EMA 收敛度参考）。
@@ -178,6 +180,9 @@ type modelCooldown struct {
 	// AuditOnly 为 true 时仅用于状态展示（例如无重置时间的 6004），
 	// healthyForModel 与 modelExempt 必须忽略它，避免改变选号行为。
 	AuditOnly bool
+	// Capacity 为 true 时表示 14003 这类暂时性模型容量避让：新会话严格避开，
+	// 已有粘性绑定可保留并继续尝试；其他模型冷却不适用该宽松语义。
+	Capacity bool
 }
 
 // modelCostTTL 成本观测的有效期。取 6 小时：既覆盖"夜间免费"这类时段性优惠的
@@ -187,10 +192,38 @@ const modelCostTTL = 6 * time.Hour
 
 // modelCostEntry 运行时成本账本（持久化镜像 stateModelCost 与其字段一一对应）。
 type modelCostEntry struct {
+	// CostPer1k 指数平滑单价，只作层内排序与展示，**不参与判层**（见 tier）。
 	CostPer1k float64
+	// LastPer1k 最近一次原始观测单价（指针：nil = 引入本字段前的旧数据）。
+	// 判层唯一依据——免费↔收费可双向翻转，不受平滑残值拖累。
+	LastPer1k *float64
 	LastSeen  time.Time
 	Samples   int
 }
+
+// tier 该 (账号, 模型) 的成本层：0 = 实测免费，2 = 实测收费（无观测不在这里表示，
+// 由调用方先判 modelCostOf 是否命中）。
+//
+// 为什么不用 EMA 判层：CostPer1k = prev*0.7 + per1k*0.3 是正数时只会无限逼近 0、
+// 永不等于 0。按 `CostPer1k <= 0` 判免费，一个号只要付过一次费就永久停在收费层，
+// 而收费层被硬过滤 → 拿不到新观测 → 数学上再也回不到免费层（只能等 6h TTL 过期），
+// 结果该模型全部流量压在少数号上。判层改用最近一次原始观测，EMA 残值只作旁证。
+//
+// LastPer1k 为 nil（旧台账）时回退 EMA 口径，行为与引入本字段前一致；旧条目在
+// 恢复侧一次性丢弃（见 applyAccountsLocked），所以回退只是兜底。
+func (mc modelCostEntry) tier() int {
+	if mc.LastPer1k != nil {
+		if *mc.LastPer1k <= 0 {
+			return 0
+		}
+		return 2
+	}
+	if mc.CostPer1k <= 0 {
+		return 0
+	}
+	return 2
+}
+
 type entry struct {
 	a            *auth.Auth
 	credits      int64
@@ -204,11 +237,11 @@ type entry struct {
 	// expiryBuckets 全部未来到期批次按自然日聚合（升序）。供面板快照展示与
 	// NoteModelCost 的 FEFO 近似扣减；由 SetCreditsSnapshot 整体替换。
 	expiryBuckets []ExpiryBucket
-	successCount             int64      // 累计成功
-	errTotal                 int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
-	lastErr                  time.Time  // 最近一次错误时间
-	lastSuccess              time.Time  // 最近一次成功时间
-	tokenUsage               TokenUsage // 聊天请求 token 用量摘要（持久化）
+	successCount  int64      // 累计成功
+	errTotal      int64      // 累计错误（供成功率权重 successRate = successCount/(successCount+errTotal)，不清零）
+	lastErr       time.Time  // 最近一次错误时间
+	lastSuccess   time.Time  // 最近一次成功时间
+	tokenUsage    TokenUsage // 聊天请求 token 用量摘要（持久化）
 	// lastCheckinDay 最近一次签到成功的本地日期（"2006-01-02"）。签到成功与上游
 	// 幂等拒绝（"今天已签到"）都算；statusOf 据此输出 CheckinDone 供面板按钮显示
 	// 签到/已签。持久化：跨重启不丢当日状态。
@@ -219,14 +252,18 @@ type entry struct {
 	// paused 暂停选号：与 disabled 正交。置位后退出选号候选（healthy 判否），
 	// 但保号任务遍历只按 Disabled 过滤，故 paused 号天然继续参与签到 / 活跃上报 /
 	// 保活 / 余额刷新。持久化（state.json），跨重启不丢。
-	paused         bool
-	reason         string
-	lastUsed       time.Time // 最近被选中时刻（防并发撞号）
+	paused   bool
+	reason   string
+	lastUsed time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
 	// usedSeq 提供严格全序，与时间精度无关。运行态，不持久化。
 	usedSeq uint64
+	// pickStamps 最近选中时间环（运行态，不持久化）。默认加权选号按窗口内被选
+	// 次数乘 1/(1+decay×count) 降权，把新流量摊向少用账号；有界环防内存膨胀。
+	// 会话粘性命中不走 pick，因此不影响长会话已经绑定的账号。
+	pickStamps []time.Time
 	// breakerUntil / fails / retryCount 为熔断器运行态（不持久化）。
 	// fails 是唯一的"连续失败"计数器：任何错误喂入，达到 breakerThreshold 触发熔断（指数退避），
 	// 跨入口累计，成功/熔断/统一复活时清零（保留 retryCount 驱动退避指数）。
@@ -250,6 +287,9 @@ type entry struct {
 	// 重学（再吃 2 次失败才禁用，期间每次都白打一轮上游）；清零点（refresh/chat 成功、
 	// 手工复活）同样落盘，重启后不残留旧计数。
 	sessionDeadFails int
+	// disabledAt 进入禁用态的时刻：只用于「会话失效自动复核」的节流（距上次尝试多久），
+	// 不参与任何选号判定。
+	disabledAt time.Time
 	// consecutiveFails 连续失败计数（连败降权，issue #114）——「不知道原因的兜底」：
 	// 覆盖 ErrClient（未知 4xx）与传输层失败（连不上上游）这类 applyErrorPolicy
 	// default 分支不罚号的形态。与 sessionDeadFails 同构但独立计数：12153 的终态
@@ -350,11 +390,22 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 		return false
 	}
 	if e.modelCooled(now, reqModel) {
-		// 该模型在 6004 独立冷却中 → 不可选。
 		return false
 	}
-	// 账号级冷却/熔断先判；若未冷却则由账号级健康决定。
 	return e.healthy(now)
+}
+
+// stickyHealthyForModel 校验已有会话绑定。普通选号仍严格排除所有模型冷却；
+// 仅 14003 容量短窗口允许保留并继续使用原绑定，账号级故障与其他模型冷却不放行。
+func (e *entry) stickyHealthyForModel(now time.Time, reqModel string) bool {
+	if !e.healthy(now) {
+		return false
+	}
+	mc, ok := e.modelCooldowns[reqModel]
+	if !ok || mc.AuditOnly || mc.Until.IsZero() || !now.Before(mc.Until) {
+		return true
+	}
+	return mc.Capacity
 }
 
 // pruneExpiredModelCosts 删除 modelCost 中已过期的条目（惰性清理，与
@@ -443,10 +494,10 @@ type stateAccount struct {
 	SuccessCount int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
-	ErrTotal    int64      `json:"err_total,omitempty"`
-	ErrCount       int        `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
-	LastSuccess    time.Time  `json:"last_success,omitempty"`
-	LastErr        time.Time  `json:"last_err,omitempty"`
+	ErrTotal    int64     `json:"err_total,omitempty"`
+	ErrCount    int       `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
+	LastSuccess time.Time `json:"last_success,omitempty"`
+	LastErr     time.Time `json:"last_err,omitempty"`
 	// LastCheckinDay 最近一次签到成功的本地日期（entry.lastCheckinDay 同源）。
 	// 持久化以保留「当日已签」状态：签到后重启，面板按钮不回退成「签到」。
 	LastCheckinDay string     `json:"last_checkin_day,omitempty"`
@@ -454,6 +505,10 @@ type stateAccount struct {
 	// 运行态计数（soft_streak/session_dead_fails/credits_expiring）不用 omitempty：
 	// 零值缺失会让人误以为"没记录"，实际是零值被省略。
 	SoftStreak int `json:"soft_streak"`
+	// DisabledAt 进入禁用态的时刻。仅供「会话失效自动复核」判断距上次尝试多久，
+	// 不参与选号。零值 = 旧状态文件没有该字段（按「刚刚禁用」处理，避免升级瞬间
+	// 把所有历史禁用号一起探测）。
+	DisabledAt time.Time `json:"disabled_at,omitempty"`
 	// SessionDeadFails 连续 12153 计数（判定 session 死亡的进度）。持久化以保留
 	// 「重启后连续计数继续累计」。
 	SessionDeadFails int `json:"session_dead_fails"`
@@ -501,12 +556,15 @@ type stateModelCooldown struct {
 	ResetAt   time.Time `json:"reset_at,omitempty"`
 	Reason    string    `json:"reason,omitempty"`
 	AuditOnly bool      `json:"audit_only,omitempty"`
+	Capacity  bool      `json:"capacity,omitempty"`
 }
 
 // stateModelCost 单个 (账号, 模型) 的成本观测持久化记录，与运行态 modelCostEntry
-// 同构（单一表示，内存与落盘不搞两套）。
+// 同构（单一表示，内存与落盘不搞两套）。last_per_1k 为判层依据，omitempty 只为
+// 兼容旧文件；新写入恒带该字段。
 type stateModelCost struct {
 	CostPer1k float64   `json:"cost_per_1k"`
+	LastPer1k *float64  `json:"last_per_1k,omitempty"`
 	LastSeen  time.Time `json:"last_seen"`
 	Samples   int       `json:"samples,omitempty"`
 }

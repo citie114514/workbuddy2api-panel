@@ -203,6 +203,49 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .box > header select, .box > header input { width: auto; }
 .box > header h3 { white-space: nowrap; }
 .box .pad { padding: 17px; }
+
+/* ── 区块折叠（运行日志页：请求记录 / 运行日志 / 积分历史）──────────────
+   三个区块串在一页上会把页面拉得很长，移动端尤其难滚。这里给每个区块一个
+   标题栏三角开关：折叠后只留标题栏，过滤栏/表格/日志体一起藏掉。
+   状态由 app.js 写到 data-folded 并记忆到 localStorage。 */
+/* 标题行：三角与标题绑在一个 flex 行里。header 本身允许换行（chips/统计要换行），
+   若把两者并列成 header 的直接子项，标题就会被换行规则推到下一行、只剩三角独占一行。 */
+.box > header > .htl { display: flex; align-items: center; gap: 12px; flex: 1 1 auto; min-width: 0; }
+.box > header > .htl > .fold {
+  flex: 0 0 auto; margin-left: -6px; padding: 0; width: 24px; height: 24px;
+  display: grid; place-items: center; border: none; background: none; cursor: pointer;
+  color: var(--ink-3); border-radius: 6px;
+}
+.box > header .fold:hover { background: var(--surface-2); color: var(--ink); }
+.box > header .fold:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* 三角用边框画，省掉内联 SVG：默指向下（展开态），折叠时转成指向右。 */
+.box > header .fold::before {
+  content: ""; width: 0; height: 0;
+  border-left: 5px solid currentColor;
+  border-top: 4.5px solid transparent; border-bottom: 4.5px solid transparent;
+  transform: rotate(90deg); transition: transform .18s ease;
+}
+.box[data-folded] > header .fold::before { transform: none; }
+.box[data-folded] > :not(header) { display: none; }
+.box[data-folded] > header { border-bottom: none; }
+/* 积分历史没有自带限高，100 条会把页面推到很远；与其他两张表对齐到 460px。 */
+#view-logs .box[data-fold="credit"] .tbl-wrap { max-height: 460px; overflow: auto; }
+/* 标题也是折叠热区（移动端不必精确点中小三角），给个手型提示。 */
+#view-logs .box[data-fold] > header > .htl > h3 { cursor: pointer; }
+@media (max-width: 760px) {
+  /* 移动端把触控区放大到 44px（HIG 最小点击目标），视觉仍只是个小三角。 */
+  .box > header .fold { width: 44px; height: 44px; margin: -10px 0 -10px -14px; }
+
+  /* 窄屏：标题行独占一条，chips/统计各自换行，谁也不挤谁。
+     标题放开 nowrap 后可以收缩，hint 折到标题下方并与标题左对齐。 */
+  #view-logs .box > header > .htl { flex: 1 1 100%; }
+  #view-logs .box > header > .htl > h3 { flex: 1 1 0; min-width: 0; white-space: normal; }
+  #view-logs .box > header > .grow { display: none; }
+  /* 统计/归档两段是次要信息，窄屏让它们各占整行，别和标题抢同一行的宽度
+     （id 选择器优先级高于 .note 的写法，必须显式覆盖 flex-basis）。 */
+  #view-logs .box > header > #reqSummary,
+  #view-logs .box > header > #reqNote { flex: 1 1 100%; text-align: left; }
+}
 /* 补偿活动行：昵称 / 状态标 / 截止倒计时 / 额度 / 领取按钮，单行紧凑排布。
    沿用 .tag 体系染色（ok=已领、warn=待领、bad=临期、mute=中性信息）。 */
 .comp-row { display: flex; align-items: center; gap: 9px; padding: 7px 0; border-bottom: 1px solid var(--line-soft); }
@@ -969,6 +1012,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                   <input type="checkbox" name="keepalive_enabled"></div>
                 <label class="fld"><span class="lb">保活时点（小时，逗号分隔）</span>
                   <input name="keepalive_hours" placeholder="22"></label>
+                <label class="fld"><span class="lb">保活临期窗口（Go 时长）</span>
+                  <input name="keepalive_refresh_window" placeholder="168h">
+                  <span class="hint">排程保活只刷新剩余有效期不超过该时长的凭证；已过期或无到期时间仍刷新，手动「全部保活」始终全量</span></label>
               </div>
             </div>
             <div class="hr"></div>
@@ -989,11 +1035,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               </div>
             </div>
             <div class="hr"></div>
-            <div class="grid2">
+            <div class="grid3">
               <div class="switch"><span class="lb">后台刷新余额</span>
                 <input type="checkbox" name="balance_refresh_enabled"></div>
               <label class="fld"><span class="lb">刷新间隔（分钟）</span>
                 <input name="balance_refresh_minutes" type="number" min="1" placeholder="5"></label>
+              <label class="fld"><span class="lb">间隔抖动（千分比）</span>
+                <input name="balance_refresh_jitter_permill" type="number" min="0" max="500" placeholder="0">
+                <span class="hint">0 = 固定间隔；200 = 每轮在 ±20% 内随机</span></label>
             </div>
             <div class="hr"></div>
             <div class="grid2">
@@ -1003,12 +1052,20 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="growth_hours" placeholder="1">
                 <span class="hint">每日到点自动「扫描 + 执行全部待办」（Sequential 任务链零点解锁后自动推进，建议零点后）</span></label>
             </div>
-            <div class="hr"></div>
             <div class="grid2">
+              <label class="fld"><span class="lb">夜间参与账号上限</span>
+                <input name="night_account_cap" type="number" min="0" placeholder="0">
+                <span class="hint">0 = 不限。大于 0 时，夜猫子（23:00–08:00 窗口内的 glm-5.2 真实对话补足）只让积分最高的前 N 个账号参与，其余夜间静默；白天的任务仍全池保号</span></label>
+            </div>
+            <div class="hr"></div>
+            <div class="grid3">
               <div class="switch"><span class="lb">任务补领清扫</span>
                 <input type="checkbox" name="task_sweep_enabled" checked></div>
               <label class="fld"><span class="lb">清扫间隔（分钟）</span>
                 <input name="task_sweep_minutes" type="number" min="1" placeholder="15"></label>
+              <label class="fld"><span class="lb">间隔抖动（千分比）</span>
+                <input name="task_sweep_jitter_permill" type="number" min="0" max="500" placeholder="0">
+                <span class="hint">0 = 固定间隔；200 = 每轮在 ±20% 内随机</span></label>
             </div>
             <div class="hint">周期扫描全部账号，把「进度已达标但尚未领奖」的成长任务补领掉（不含自动动作的口令任务也能领），并顺带接受未接受的任务。只发 accept / claim 两条<b>幂等</b>请求，不跑任何对话或上报行为，开销可忽略。<br>用途：真实对话点亮的任务不在自动动作白名单里，成长队列与「一键完成」都不会去领它——积分因此卡在半路上不去（#174）。</div>
             <div class="hr"></div>
@@ -1160,9 +1217,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
     <!-- 日志 -->
     <section class="view" id="view-logs" hidden>
-      <div class="box">
+      <div class="box" data-fold="req">
         <header>
-          <h3>请求记录 <span class="hint">调用来源：IP 取 X-Forwarded-For 首段，无代理头时回落 TCP 对端</span></h3>
+          <div class="htl">
+            <button class="fold" type="button" aria-expanded="true" aria-label="收起或展开：请求记录" title="收起 / 展开"></button>
+            <h3>请求记录 <span class="hint">调用来源：IP 取 X-Forwarded-For 首段，无代理头时回落 TCP 对端</span></h3>
+          </div>
           <span class="grow"></span>
           <span class="note" id="reqSummary">—</span>
           <span class="note" id="reqNote">—</span>
@@ -1198,9 +1258,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
       </div>
 
-      <div class="box">
+      <div class="box" data-fold="log">
         <header>
-          <h3>运行日志</h3>
+          <div class="htl">
+            <button class="fold" type="button" aria-expanded="true" aria-label="收起或展开：运行日志" title="收起 / 展开"></button>
+            <h3>运行日志</h3>
+          </div>
           <span class="grow"></span>
           <span class="chips" id="logChips">
             <button class="xs chip on" data-ch="all">全部</button>
@@ -1214,9 +1277,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <pre id="logBox"></pre>
       </div>
 
-      <div class="box">
+      <div class="box" data-fold="credit">
         <header>
-          <h3>积分历史 <span class="hint">每次真实查到余额与上次比对，变动即留痕</span></h3>
+          <div class="htl">
+            <button class="fold" type="button" aria-expanded="true" aria-label="收起或展开：积分历史" title="收起 / 展开"></button>
+            <h3>积分历史 <span class="hint">每次真实查到余额与上次比对，变动即留痕</span></h3>
+          </div>
           <span class="grow"></span>
           <span class="note" id="creditNote">—</span>
         </header>

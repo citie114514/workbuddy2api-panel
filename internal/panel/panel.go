@@ -78,6 +78,9 @@ type Panel struct {
 	mux     *http.ServeMux
 	started time.Time
 	logs    *Ring
+	// indexHTMLVersioned 是页面骨架副本：静态资源 URL 带版本查询参数，发版后
+	// 浏览器和中间缓存不会继续命中旧 app.js / mobile.js / mobile.css。
+	indexHTMLVersioned []byte
 
 	// logins 进行中的 OAuth 设备授权会话（state → 会话信息）。
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
@@ -137,11 +140,12 @@ func New(cfg Config) *Panel {
 		cfg.RedisMode = "noop"
 	}
 	p := &Panel{
-		cfg:     cfg,
-		mux:     http.NewServeMux(),
-		started: time.Now(),
-		logs:    NewRing(500),
-		logins:  map[string]loginSession{},
+		cfg:                cfg,
+		mux:                http.NewServeMux(),
+		started:            time.Now(),
+		logs:               NewRing(500),
+		logins:             map[string]loginSession{},
+		indexHTMLVersioned: versionedIndexHTML(cfg.Version),
 	}
 	p.routes()
 	return p
@@ -278,8 +282,8 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"model_locks": p.cfg.Pool.ModelLockView(),
 		// 到期提醒快照的节奏与年龄：界面轮询是 5 秒级，但卡片数据只随余额后台刷新
 		// 更新（默认每 5 分钟）——把这两个数透出，前端才能如实标注「x 分钟前更新」。
-		"balance_refresh_sec":    p.balanceRefreshSec(),
-		"balance_refreshed_at":   p.balanceRefreshedAt(),
+		"balance_refresh_sec":  p.balanceRefreshSec(),
+		"balance_refreshed_at": p.balanceRefreshedAt(),
 	})
 }
 

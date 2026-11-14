@@ -128,6 +128,9 @@ type queueItem struct {
 	Code     string `json:"code"`
 	Status   string `json:"status"` // pending | running | done | skipped | error
 	Message  string `json:"message,omitempty"`
+	// AtTarget 扫描时该任务已达标（只差领奖）。执行期不再跑自动动作，
+	// 直接领奖——避免重复打行为事件撞上游限流（详见 taskReached）。
+	AtTarget bool `json:"at_target,omitempty"`
 }
 
 // queueState 队列运行状态。Seq 每次启动 +1——前端只渲染"自己启动的那一轮"，
@@ -222,16 +225,8 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 			if a.IsGlobal() {
 				return
 			}
-			// 企业版门控：同上（企业版无个人成长体系，任务端点上游一律 403）。
-			// 企业切换会话（token_source=enterprise_switch）同跳：任务列表读得到，
-			// 但执行后行为事件被上游静默丢弃（200 不计分）——每项都是零收益白跑
-			// （含 expert_5 等真实对话配额），故不入队并给出重登指引（见
-			// auth.IsEnterpriseSession）。
+			// 真企业版门控：企业版无个人成长体系，任务端点上游一律 403。
 			if a.IsEnterprise() {
-				return
-			}
-			if a.IsEnterpriseSession() {
-				log.Printf("panel: WARN 队列跳过 uid=%s nickname=%q：凭证为企业切换会话（token_source=enterprise_switch），成长任务行为事件会被上游静默丢弃；请移除该账号，在浏览器退出企业切换（个人身份）后重新登录", a.UID, a.Nickname)
 				return
 			}
 			if growth {
@@ -273,7 +268,8 @@ func (p *Panel) startGrowthQueue(concurrency int, growth bool) (started bool, to
 	var items []queueItem
 	for _, one := range accts {
 		for _, t := range one.grow {
-			items = append(items, queueItem{UID: one.a.UID, Nickname: one.a.Nickname, Kind: "growth", Code: t.TaskCode, Status: "pending"})
+			items = append(items, queueItem{UID: one.a.UID, Nickname: one.a.Nickname, Kind: "growth",
+				Code: t.TaskCode, Status: "pending", AtTarget: taskReached(&t)})
 		}
 	}
 	if len(items) == 0 {
@@ -342,7 +338,7 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 				time.Sleep(reportGap) // 给上游状态流转留时间
 			}
 			for i := range q.items {
-				uid, kind, code := q.snapshotAt(i)
+				uid, kind, code, atTarget := q.snapshotAt(i)
 				if uid != one.a.UID {
 					continue
 				}
@@ -351,7 +347,7 @@ func (p *Panel) runQueueItems(accts []queueAccount, items []queueItem, concurren
 				var err error
 				switch kind {
 				case "growth":
-					msg, err = p.runGrowthQueued(one.a, code)
+					msg, err = p.runGrowthQueued(one.a, code, atTarget)
 				}
 				if err != nil {
 					p.queueMarkAt(i, "error", err.Error())
@@ -371,11 +367,12 @@ type queueAccount struct {
 	grow []upstream.Task
 }
 
-// snapshotAt 锁内读条目三元组（避免锁外持有指针）。
-func (q *queueState) snapshotAt(i int) (uid, kind, code string) {
+// snapshotAt 锁内读条目（避免锁外持有指针）。
+func (q *queueState) snapshotAt(i int) (uid, kind, code string, atTarget bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return q.items[i].UID, q.items[i].Kind, q.items[i].Code
+	it := &q.items[i]
+	return it.UID, it.Kind, it.Code, it.AtTarget
 }
 
 // queueMarkAt 按索引更新队列条目状态（条目数组固定不再增删）。
@@ -420,9 +417,15 @@ func (p *Panel) acceptPendingTasks(a *auth.Auth) int {
 	return len(codes)
 }
 
-// runGrowthQueued 执行单个成长任务（动作 + 回读 + 自动领奖；与
+// runGrowthQueued 执行队列里的单个成长任务（动作 + 回读 + 自动领奖；与
 // accountTaskAuto 同语义，结果以文字返回）。
-func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
+//
+// atTarget 是**扫描时**的达标判定。为什么不能只信执行前的回读：上游计分是
+// 异步的，刚上报完的进度可能短暂读回低位；只信回读会把「已达标待领」重新
+// 判成待办，于是又跑一遍补足动作、再打一批行为事件。新号连着被重跑
+// （chat_5/template_5/expert_5 都是 ×5 的循环上报）就会撞 /v2/report 限流，
+// 面板只剩一条 `upstream soft_rate (http 429)`——而任务其实早就完成了。
+func (p *Panel) runGrowthQueued(a *auth.Auth, code string, atTarget bool) (string, error) {
 	act := autoActionFor(code)
 	if act == nil {
 		return "", fmt.Errorf("任务 %s 无自动动作", code)
@@ -439,17 +442,32 @@ func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
 	if before.Claimed {
 		return "已完成（已领取）", nil
 	}
-	msg, err := act.run(p, a)
-	if err != nil {
-		return "", err
+	msg := "进度已达标，直接领奖"
+	if !atTarget && !taskReached(before) {
+		msg, err = act.run(p, a)
+		if err != nil {
+			return "", err
+		}
 	}
 	var after *upstream.Task
-	if isMP {
+	switch {
+	case isMP:
 		after, _ = p.taskByCodeMP(a, code)
-	} else {
+	case atTarget:
+		// 扫描时已确认达标，不必等上游异步计分落定：只读一次即可，
+		// 免掉 taskByCodeWaiting 最多 12s 的空轮询。
+		after, _ = p.taskByCode(a, code)
+	default:
 		after, _ = p.taskByCodeWaiting(a, code)
 	}
-	if after != nil && after.Claimable {
+	// 是否领奖：Claimable 是上游权威信号；扫描已判达标的再兜一层——回读可能
+	// 因计分异步而偏低，而 claim 幂等（重复领返回 already_claimed → 0 分 0 能），
+	// 与该口径保持一致（runAutoAll 亦按 Current>=Target 判，不看 Claimable）。
+	shouldClaim := after != nil && after.Claimable
+	if atTarget && after != nil && !after.Claimed {
+		shouldClaim = true
+	}
+	if shouldClaim {
 		var credit, energy int64
 		var cerr error
 		if isMP {

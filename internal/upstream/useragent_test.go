@@ -20,9 +20,12 @@ func (t uaCaptureTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 // TestUserAgentDefaultEmptyKeepsClientUA 默认（UserAgent/client_name 空）行为：
-// chat/refresh 路径 UA=默认 WorkBuddy 三段式；billing 路径（report/travel/balance）
+// chat/refresh 路径 UA=默认 WorkBuddy 三段式；billing 路径（travel/balance/checkin）
 // 单段 WorkBuddy/<ver>（对齐官方 banner 白名单头组，默认伪造桌面端指纹）；
 // 显式 client_name="SaaS" 才还原"billing 不设 UA"的旧行为。
+//
+// /v2/report 例外：逐字节核对后单列 ReportHeaders，UA 对齐官方内置 CLI 进程的
+// 两段形态 CLI/<cliVer> WorkBuddy/<cliVer>。
 func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -44,11 +47,12 @@ func TestUserAgentDefaultEmptyKeepsClientUA(t *testing.T) {
 			wantUA: defaultUAString,
 		},
 		{
-			name: "billing_report",
+			// 该通道发送方是桌面端守护进程：UA 单段 `WorkBuddy/<clientVersion>`。
+			name: "report_desktop_ua",
 			call: func(c *Client) error {
 				return c.ReportChatActivity(&auth.Auth{AccessToken: "at", UID: "u1"}, "cid", "")
 			},
-			wantUA: "WorkBuddy/5.5.4",
+			wantUA: "WorkBuddy/" + defaultClientVersion,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -160,11 +164,16 @@ func TestFetchModelsUsesConfiguredUA(t *testing.T) {
 // --- A 段：UA 对齐官方 WorkBuddy 三段式 ---
 
 const (
-	defaultUAString      = "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"
-	explicitString       = "MyCustomAgent/3.1"
-	clientVerUAString    = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/2.137.1"
-	billingUAWorkBuddy   = "WorkBuddy/5.5.4"
-	billingUACustomVer   = "WorkBuddy/6.0.0"
+	defaultUAString   = "WorkBuddy/" + defaultClientVersion + " WorkBuddy/" + defaultClientVersion + " CLI/" + defaultCliVersion
+	explicitString    = "MyCustomAgent/3.1"
+	clientVerUAString = "WorkBuddy/6.0.0 WorkBuddy/6.0.0 CLI/" + defaultCliVersion
+	// AuthService 那组请求（积分/企业用量/签到）的 UA：官方走后台服务自己的
+	// axios 实例、buildHeaders 不设 UA，由 axios http 适配器补 `axios/1.16.1`。
+	// 2026-11-04 从本机 5.9.3 安装包 app.asar 复核（`T.set("User-Agent","axios/1.16.1",!1)`
+	// 与 AuthService.buildHeaders 两处）。此前断言的单段 `WorkBuddy/<ver>` 是 banner
+	// 形态，被错误地套到了积分/签到上。
+	billingUAWorkBuddy   = "axios/1.16.1"
+	billingUACustomVer   = "axios/1.16.1"
 	billingUAAgentString = "BillingAgent/1"
 )
 
@@ -253,7 +262,7 @@ func TestUserAgentClientVersionOverride(t *testing.T) {
 // `WorkBuddy/<clientVersion>`（不带 CLI 段，对齐官方 banner/check-in 显式头组）。
 func TestBillingUA_WhenClientNameSet(t *testing.T) {
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	// 默认 client_version → WorkBuddy/5.5.4
+	// 默认 client_version → WorkBuddy/<defaultClientVersion>
 	c := &Client{
 		HTTP: &http.Client{Transport: rtFunc(func(r *http.Request) (*http.Response, error) {
 			if got := r.Header.Get("User-Agent"); got != billingUAWorkBuddy {
@@ -320,9 +329,10 @@ func TestBillingUA_WhenClientNameEmpty(t *testing.T) {
 	if _, _, err := c.UserResource(a); err != nil {
 		t.Errorf("userResource: %v", err)
 	}
-	if ua != "WorkBuddy/6.0.0" {
-		t.Errorf("billing UA = %q want WorkBuddy/6.0.0 (default desktop fingerprint)", ua)
+	if ua != "axios/1.16.1" {
+		t.Errorf("积分查询 UA = %q want axios/1.16.1（AuthService 自己的 axios 实例，官方 buildHeaders 不设 UA）", ua)
 	}
+	// billingUA() 本身没变：它服务 banner 那类显式覆写 UA 的端点，仍是单段。
 	if got := c.billingUA(); got != "WorkBuddy/6.0.0" {
 		t.Errorf("billingUA() = %q want WorkBuddy/6.0.0", got)
 	}

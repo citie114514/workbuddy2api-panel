@@ -180,7 +180,7 @@ func TestUpgConcurrentFullRefreshLedgerConsistent(t *testing.T) {
 			t.Fatalf("重启读盘与内存不一致，缺 %s（磁盘=%+v）", key(e), disk)
 		}
 	}
-	// 磁盘快照：8 个账号齐全，变化账号为新值、未变化账号保持旧值
+	// 磁盘快照：全部账号齐全，变化账号为新值、未变化账号保持旧值
 	rawFile, err := os.ReadFile(ledgerPath)
 	if err != nil {
 		t.Fatal(err)

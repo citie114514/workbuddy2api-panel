@@ -2,13 +2,10 @@
 package pool
 
 import (
+	"math"
 	"sort"
 	"time"
 )
-
-// expiringVirtualSlots 快过期账号在新会话候选集中的虚拟实例权重。
-// 3:1 是温和偏好，不是固定比例：账号组成变化会自然改变最终占比。
-const expiringVirtualSlots = 3
 
 // AvailableUIDsForRealm 同 AvailableUIDs，但仅返回 Realm()==realm 的账号。
 // realm=="" 退化为 AvailableUIDs（现状语义）。
@@ -65,9 +62,9 @@ func (p *Pool) ServableForModelRealm(model, realm string) int {
 
 // WeightedAvailableUIDsForModelRealm 返回带虚拟实例权重的可用账号列表。
 //
-// 普通账号出现 1 次；有效快过期账号出现 expiringVirtualSlots 次。调用方继续按
-// 原有序列表哈希，即可让新会话对快过期账号形成温和偏好。重复项按 UID 排序后
-// 展开，保证同一账号拓扑下不同进程得到一致列表。
+// 普通账号出现 1 次；窗口内有快过期积分的账号按其紧迫度名次出现 8/6/5/4/3 次
+// （第 6 名及以后 3 次）。调用方继续按原有序列表哈希，即可让新会话把流量优先分给
+// 最急的几个号。重复项按 UID 排序后展开，保证同一账号拓扑下不同进程得到一致列表。
 //
 // 该方法是现有 AvailableUIDsForModelRealm 的增量入口，不改变旧方法语义，也不
 // 修改配置、状态或 Redis schema。prefer_expiring=false 时退化为逐账号一次。
@@ -90,19 +87,36 @@ func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string 
 	}
 	sort.Strings(uids)
 
+	// 与选号侧共用同一份名次（按域算、只看池内状态），使「新会话分给谁」和
+	// 「老会话换号给谁」对同一批快过期账号给出同样的先后——两套口径各算一套排名
+	// 会让新会话集中到第 1 名、换号却抽到第 5 名。
+	expRank := map[string]int(nil)
+	if p.preferExpiring {
+		expRank = p.expiringRankLocked(now, p.expiringWindowLocked(now, realm), realm)
+	}
 	out := make([]string, 0, len(uids))
 	for _, uid := range uids {
-		slots := 1
-		if p.preferExpiring {
-			if e := p.byUID[uid]; expiringNow(e, now) {
-				slots = expiringVirtualSlots
-			}
+		slots := int(math.Round(expiringSlots(expRank[uid])))
+		if slots < 1 {
+			slots = 1
 		}
 		for i := 0; i < slots; i++ {
 			out = append(out, uid)
 		}
 	}
 	return out
+}
+
+// StickyEligibleForModelRealm 判断已有绑定能否保留：只看账号与模型健康，
+// 不看在途名额。新会话分配仍使用 AvailableUIDsForModelRealm。
+func (p *Pool) StickyEligibleForModelRealm(uid, model, realm string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok || (realm != "" && e.a.Realm() != realm) {
+		return false
+	}
+	return e.stickyHealthyForModel(time.Now(), model)
 }
 
 // AvailableUIDsForModelRealm 同 AvailableUIDsForModel，但仅返回 Realm()==realm 的账号

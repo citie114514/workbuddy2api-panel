@@ -19,6 +19,8 @@ var sanitizeFeatures = []string{
 	"Main branch (",              // 注入指令句（截断前缀即可命中）
 	"You are a coding agent running in the Codex CLI", // Codex instructions 首段（截断前缀即可命中）
 	"github.com/anthropics/",                          // 反馈句里的 Anthropic 仓库链接
+	"Codex CLI is an open source",                     // Codex 说明句（上游首行触发 token）
+	"Tokens prefixed with @ are paths",                // DSH 路径提示句首（与下句连排触发）
 	"11128",                                           // 上游反探测：裸数字错误码
 }
 
@@ -67,6 +69,28 @@ var sanitizeRewrites = [][2]string{
 		"To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
 	},
 	{
+		// Codex 说明句：上游把它列为 system 首行的触发 token（dddmiku 2026-10-17
+		// 的 12 组对照实验：`Codex CLI is an open source project led by OpenAI`）。
+		// 注意它与我们已在处理的 "You are a coding agent running in the Codex CLI"
+		// **不是同一句**——那句是 instructions 首段，这句是独立说明句。
+		// open source → open-source 一词之差即可绕过，语义不变。
+		"Codex CLI is an open source project led by OpenAI",
+		"Codex CLI is an open-source project led by OpenAI",
+	},
+	{
+		// DSH 系统提示里的两句路径说明：相邻连排即触发渠道校验（2026-10-27 实测，
+		// 单句各自 200）。只在 "are paths" 后插入 that 拆断连排、语义不变；
+		// 匹配串不带结尾标点，句号与换行两种形态一并覆盖。
+		"Tokens prefixed with @ are paths the user explicitly referenced",
+		"Tokens prefixed with @ are paths that the user explicitly referenced",
+	},
+}
+
+// sanitizeAntiProbe 上游反探测串：请求体里出现裸 11-128 即整单拦截（与该数字的
+// 上下文无关）。**任何角色都要改写**——用户粘贴报错、工具回显错误码同样是拦截
+// 条件，它与「客户端是谁」无关，不能随身份域一起收窄。
+var sanitizeAntiProbe = [][2]string{
+	{
 		// 上游反探测：只要请求体里出现裸数字 11128 就整单拦截（与该数字的上下文无关——
 		// "code=11128" / 裸 "11128" / "错误码 11128" / "Code=11128" 全部命中；
 		// 相邻的 11148 / 11101 / 11115 / 99999 均放行）。11128 正是本类拦截自身的错误码，
@@ -78,27 +102,138 @@ var sanitizeRewrites = [][2]string{
 	},
 }
 
-// sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
+// 以下规则清理三类渠道指纹：自我介绍归属句、DeepSeek Harness 描述、
+// OhMyOpenCode 子代理身份串。大小写不敏感，路径与标识符不做宽泛替换。
+var (
+	// RE2 没有前瞻，句尾由 rewriteIdentitySentences 手工找。
+	sanitizeIdentityStartRe = regexp.MustCompile(`(?i)You are\s+` +
+		`(?:an?\s+|the\s+)?(?:[\w.-]+\s+){0,3}?` +
+		`(?:(?:agent|assistant|model|AI|LLM)\b)?[\s,]*` +
+		`(?:powered by|built on|built by|created by|developed by|made by|trained by)\b`)
+	sanitizeDSHGUIRe = regexp.MustCompile(`(?i)(You are interacting with the user through the ` +
+		`DeepSeek[ \t]+Harness[ \t]+Web[ \t]+GUI) whose URL the runtime context names\.`)
+	// 只认空格与制表符，deepseek-harness、deepseek_harness 这类路径与标识符不动。
+	sanitizeBrandRe = regexp.MustCompile(`(?i)DeepSeek[ \t]+Harness`)
+	sanitizeOmORe   = regexp.MustCompile(`(?i)Sisyphus-Junior - Focused executor from OhMyOpenCode`)
+)
+
+// sanitizeIdentityReplacement 身份句的改写串。**不能带 "AI"**：
+//
+// 上游对 system 首行有一套「禁用开头」名单，「You are a helpful AI assistant.」
+// 正是名单里的第一条——我们原先把 Claude/Codex 的身份句洗成了另一句可疑开头，
+// 洗了个寂寞。改成无 "AI" 的形态（与社区实测可过的一致），语义不变。
+const sanitizeIdentityReplacement = "You are a helpful assistant."
+
+var sanitizeIdentityVerbs = []string{
+	"powered by", "built on", "built by", "created by", "developed by", "made by", "trained by",
+}
+
+// containsFoldASCII 不分配内存的大小写不敏感子串判断，needle 须是小写 ASCII。
+func containsFoldASCII(s, needle string) bool {
+	n := len(needle)
+	for i := 0; i+n <= len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c == needle[0] && strings.EqualFold(s[i:i+n], needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// rewriteIdentitySentences 整句替换自我介绍，模型名中的点不误作句尾，换行原样保留。
+func rewriteIdentitySentences(text string) string {
+	var b strings.Builder
+	rest := text
+	for {
+		loc := sanitizeIdentityStartRe.FindStringIndex(rest)
+		if loc == nil {
+			b.WriteString(rest)
+			return b.String()
+		}
+		b.WriteString(rest[:loc[0]])
+		tail := rest[loc[1]:]
+		end := len(tail)
+		for i := 0; i < len(tail); i++ {
+			if tail[i] == '\n' {
+				end = i
+				break
+			}
+			if tail[i] == '.' && (i+1 == len(tail) || strings.IndexByte(" \t\r\n", tail[i+1]) >= 0) {
+				end = i + 1
+				break
+			}
+		}
+		b.WriteString(sanitizeIdentityReplacement)
+		rest = tail[end:]
+	}
+}
+
+func hasChannelFingerprint(text string) bool {
+	if containsFoldASCII(text, "harness") && sanitizeBrandRe.MatchString(text) {
+		return true
+	}
+	if containsFoldASCII(text, "ohmyopencode") && sanitizeOmORe.MatchString(text) {
+		return true
+	}
+	for _, v := range sanitizeIdentityVerbs {
+		if containsFoldASCII(text, v) {
+			return sanitizeIdentityStartRe.MatchString(text)
+		}
+	}
+	return false
+}
+
+// sanitizeText 全量净化（身份域角色：system / developer / assistant）。
+// 包内单测与默认口径走全量；按角色收窄请用 sanitizeTextScoped。
 func sanitizeText(text string) string {
+	return sanitizeTextScoped(text, true)
+}
+
+// sanitizeTextScoped 按角色作用域净化单段文本。
+//
+// identity=false（user / tool / function 消息）时只跑**反探测串**与 header 键名
+// 两类规则：它们描述的是「渠道指纹」，与该消息是不是用户内容无关，漏掉就是
+// 整单拦截。身份句 / 模板句改写一律跳过——同一句出现在 user / tool 里属**用户
+// 数据**（用户粘贴的 system prompt、工具读到的文件内容），改写等于篡改用户输入。
+func sanitizeTextScoped(text string, identity bool) string {
 	if !hasFingerprint(text) {
 		return text
 	}
-	for _, rw := range sanitizeRewrites {
-		text = strings.ReplaceAll(text, rw[0], rw[1])
+	out := text
+	if identity {
+		out = sanitizeOmORe.ReplaceAllString(out, "Sisyphus-Junior - Focused executor")
+		out = rewriteIdentitySentences(out)
+		// GUI 描述段要认品牌全名，先于品牌缩减。
+		out = sanitizeDSHGUIRe.ReplaceAllString(out, "${1} whose URL is named in the runtime context.")
+		out = sanitizeBrandRe.ReplaceAllString(out, "DeepSeek")
+		for _, rw := range sanitizeRewrites {
+			out = strings.ReplaceAll(out, rw[0], rw[1])
+		}
 	}
-	if sanitizeHdrRe.MatchString(text) {
-		text = sanitizeHdrRe.ReplaceAllString(text, "")
+	for _, rw := range sanitizeAntiProbe {
+		out = strings.ReplaceAll(out, rw[0], rw[1])
 	}
-	if strings.Contains(text, "cc_") {
+	if sanitizeHdrRe.MatchString(out) {
+		out = sanitizeHdrRe.ReplaceAllString(out, "")
+	}
+	if strings.Contains(out, "cc_") {
 		prev := ""
-		for prev != text { // 清尾随裸 kv（cc_version=...; cc_entrypoint=...;）
-			prev = text
-			text = sanitizeKvRe.ReplaceAllString(text, "")
+		for prev != out { // 清尾随裸 kv（）
+			prev = out
+			out = sanitizeKvRe.ReplaceAllString(out, "")
 		}
 	}
 	// 兜底：键值形态已在上面整段删除，这里只剩裸键名（引用/示例文本形态）。
-	text = sanitizeBareHdrRe.ReplaceAllString(text, "x-anthropic-billing-hdr")
-	return strings.TrimSpace(text)
+	out = sanitizeBareHdrRe.ReplaceAllString(out, "x-anthropic-billing-hdr")
+	if out == text {
+		// 一条规则都没命中（例如 user 消息只撞上身份句预检而作用域不允许改写）：
+		// 原样返回。绝不顺手 TrimSpace —— 那也是对用户内容的改动。
+		return text
+	}
+	return strings.TrimSpace(out)
 }
 
 // hasFingerprint 特征预检：先走 strings.Contains 快速路径（零分配）；
@@ -112,15 +247,15 @@ func hasFingerprint(text string) bool {
 			return true
 		}
 	}
-	return sanitizeBareHdrRe.MatchString(text)
+	return sanitizeBareHdrRe.MatchString(text) || hasChannelFingerprint(text)
 }
 
 // sanitizeContent 兼容字符串与多模态数组；只动 text part，image 等 part 不动。
-// 返回净化后的值及是否发生变化。
-func sanitizeContent(v any) (any, bool) {
+// 返回净化后的值及是否发生变化；identity 由消息角色决定（见 sanitizeIdentityRole）。
+func sanitizeContent(v any, identity bool) (any, bool) {
 	switch c := v.(type) {
 	case string:
-		s := sanitizeText(c)
+		s := sanitizeTextScoped(c, identity)
 		return s, s != c
 	case []any:
 		changed := false
@@ -133,7 +268,7 @@ func sanitizeContent(v any) (any, bool) {
 			if !ok {
 				continue
 			}
-			if s := sanitizeText(text); s != text {
+			if s := sanitizeTextScoped(text, identity); s != text {
 				m["text"] = s
 				changed = true
 			}
@@ -149,7 +284,7 @@ func sanitizeContent(v any) (any, bool) {
 // 这块长期是盲区：工具调用消息的 content 通常是 null，而旧版 sanitizeMessages
 // 在 content 缺失时直接 continue，整条消息连 tool_calls 一起被跳过——
 // 于是历史里任何写进工具参数的被拦字符串（文件名、命令、写入内容）都会原样漏出。
-func sanitizeToolCalls(v any) bool {
+func sanitizeToolCalls(v any, identity bool) bool {
 	callList, ok := v.([]any)
 	if !ok {
 		return false
@@ -168,7 +303,7 @@ func sanitizeToolCalls(v any) bool {
 		if !ok {
 			continue
 		}
-		if s := sanitizeText(args); s != args {
+		if s := sanitizeTextScoped(args, identity); s != args {
 			fn["arguments"] = s
 			changed = true
 		}
@@ -177,6 +312,22 @@ func sanitizeToolCalls(v any) bool {
 }
 
 // sanitizeMessages 净化 messages 中的 content 与 tool_calls；任一命中返回 true。
+
+// sanitizeIdentityRole 报告该角色是否属「身份域」：只有这些角色的文本承载
+// 「客户端是谁」的指纹（system prompt / developer instruction / 模型自述）。
+// user / tool / function 里出现同样的句子属用户数据，只跑反探测规则。
+//
+// 未知或缺失角色按身份域处理：宁可多洗一层，也不要让指纹漏出去。
+func sanitizeIdentityRole(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "user", "tool", "function":
+		return false
+	}
+	return true
+}
+
+// sanitizeMessages 净化 messages 中的 content / reasoning* / tool_calls；
+// 任一命中返回 true。作用域按消息角色分流（见 sanitizeIdentityRole）。
 func sanitizeMessages(messages []any) bool {
 	changed := false
 	for _, msg := range messages {
@@ -184,18 +335,20 @@ func sanitizeMessages(messages []any) bool {
 		if !ok {
 			continue
 		}
+		role, _ := m["role"].(string)
+		identity := sanitizeIdentityRole(role)
 		// content 与 tool_calls 各自独立判断：content 可以为 null（工具调用轮），
 		// 早期版本在此 continue，导致这类消息的 tool_calls 完全不被净化。
 		if c, ok := m["content"]; ok {
-			if nc, ch := sanitizeContent(c); ch {
+			if nc, ch := sanitizeContent(c, identity); ch {
 				m["content"] = nc
 				changed = true
 			}
 		}
 		// reasoning_content（思维链回填字段，见 thinking.go/sse.go）实测同样
-		// 携带指纹，与 content 同等净化。string 形态直接走 sanitizeText。
+		// 携带指纹，与 content 同等净化。string 形态直接走 sanitizeTextScoped。
 		if rc, ok := m["reasoning_content"].(string); ok {
-			if s := sanitizeText(rc); s != rc {
+			if s := sanitizeTextScoped(rc, identity); s != rc {
 				m["reasoning_content"] = s
 				changed = true
 			}
@@ -203,15 +356,15 @@ func sanitizeMessages(messages []any) bool {
 		// reasoning：另一形态的思维链字段。thinking.go 的回填会把客户端送来的
 		// reasoning_content 镜像进 reasoning（反之亦然），而此前只洗 content /
 		// reasoning_content / tool_calls —— 镜像进 reasoning 的指纹原样出站，
-		// 裸 "11128" 这种反探测串同样致命。
+		// 裸 "11-128" 这种反探测串同样致命。
 		if r, ok := m["reasoning"].(string); ok {
-			if s := sanitizeText(r); s != r {
+			if s := sanitizeTextScoped(r, identity); s != r {
 				m["reasoning"] = s
 				changed = true
 			}
 		}
 		if tc, ok := m["tool_calls"]; ok {
-			if sanitizeToolCalls(tc) {
+			if sanitizeToolCalls(tc, identity) {
 				changed = true
 			}
 		}

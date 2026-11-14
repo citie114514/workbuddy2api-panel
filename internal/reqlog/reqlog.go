@@ -80,10 +80,19 @@ type Event struct {
 	HasCredit        bool      `json:"credit_known"`
 	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
-	CacheHitTokens  int64 `json:"cache_hit_tokens,omitempty"`
-	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
-	ClientIP         string    `json:"client_ip,omitempty"`
-	UserAgent        string    `json:"user_agent,omitempty"`
+	CacheHitTokens  int64  `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens int64  `json:"cache_miss_tokens,omitempty"`
+	ClientIP        string `json:"client_ip,omitempty"`
+	UserAgent       string `json:"user_agent,omitempty"`
+	// UpstreamCode 上游业务错误码（11101 参数错 / 11128 渠道校验 / 6004 限流等）。
+	// 只记数字码不记 msg，保持「不写响应正文」的既有约定；4xx/5xx 才有值。
+	UpstreamCode int `json:"upstream_code,omitempty"`
+	// QueuePosition / QueueRetryAfterSec 仅 6020（容量排队）时有值：上游给的排位与
+	// 建议首次等待秒数。观测字段——用它判断「排队要到号到底多久」，决定网关内是否
+	// 值得照官方查 /v2/chat/queue/status 等到 ready 再重发。
+	// 排位没给时 QueuePosition 记 -1（省略即「不是排队场景」，两者区分得开）。
+	QueuePosition      int `json:"queue_position,omitempty"`
+	QueueRetryAfterSec int `json:"queue_retry_after_sec,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），

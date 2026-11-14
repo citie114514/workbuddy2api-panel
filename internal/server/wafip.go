@@ -1,7 +1,7 @@
 // wafip.go WAF IP 级拦截 fail-fast 状态机（任务书 waf-ip-failfast）。
 //
 // 背景（fork-scan-absorb T-1 / BulidH 实测）：WAF 403 拦的是网关出口 IP 而非
-// 账号——3 个账号 1 秒内全 403。既有 ErrWafBlock 账号级软冷却（wafCooldownBase
+// 账号——多个账号在 1 秒内同时 403。既有 ErrWafBlock 账号级软冷却（wafCooldownBase
 // 起的有界退避）在 IP 级拦截时不够：轮转会把一次客户端请求放大 MaxRotate 倍，
 // 同一出口 IP 继续打上游只会加重风控。
 //

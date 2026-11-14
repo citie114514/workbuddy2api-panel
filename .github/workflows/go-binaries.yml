@@ -1,13 +1,13 @@
 name: go-binaries
 
 # 可运行二进制构建/发布：
-#   - PR / push main → 测试 + 五平台编译验证（产物仅存 artifact，不发布）
+#   - PR / push integrated → 测试 + 五平台编译验证（产物仅存 artifact，不发布）
 #   - push v* tag    → 同上 + 打包上传到 GitHub Release（zip/tar.gz + checksums）
-# 固化的发布纪律（曾两次人祸，见仓库 HANDOFF）：-s -w 剥离、二进制版本串 == 源码
-# appVersion、tag 版本 == 源码版本（-ci 后缀的测试 tag 豁免，用于演练发布线）。
+# 发布校验：-s -w 剥离、二进制版本串 == 源码 appVersion、tag 版本 == 源码版本
+# （-ci 后缀的测试 tag 豁免，用于演练发布线）。
 on:
   push:
-    branches: [main]
+    branches: [integrated]
     tags: ["v*"]
   pull_request:
     paths:
@@ -59,12 +59,18 @@ jobs:
         id: ver
         run: echo "v=$(grep -oP 'appVersion = "\K[^"]+' cmd/server/main.go)" >> "$GITHUB_OUTPUT"
 
-      - name: 构建（剥离符号，对齐本地发布口径）
+      - name: 构建（四个二进制，剥离符号，对齐 Dockerfile 口径）
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: 0
-        run: go build -ldflags "-s -w" -o "wb2api${{ matrix.goos == 'windows' && '.exe' || '' }}" ./cmd/server
+        run: |
+          EXT="${{ matrix.goos == 'windows' && '.exe' || '' }}"
+          for p in "server wb2api" "signin signin_bin" "login login" "credit credit"; do
+            set -- $p
+            go build -trimpath -ldflags "-s -w" -o "$2$EXT" "./cmd/$1"
+          done
+          ls -la wb2api$EXT signin_bin$EXT login$EXT credit$EXT
 
       # 版本串断言：二进制必须含源码 appVersion（防交叉编译矩阵里编错树/漏 ldflags）
       - name: 断言二进制版本串
@@ -76,21 +82,29 @@ jobs:
           fi
           echo "version assert OK: ${{ steps.ver.outputs.v }}"
 
-      - name: 打包（windows=zip 三件套，其余=tar.gz）
+      - name: 打包（四个二进制 + 三个运维脚本 + 排障探针）
         run: |
           V="${{ steps.ver.outputs.v }}"
           V="${V%-panel}"   # 文件名不带 -panel 后缀（wb2api-panel-v1.2.3-... 既有惯例）
+          # 裸二进制部署时 signin/login/credit 二进制由同名 .sh 驱动，脚本须与二进制同目录
+          # 解包（三个 .sh 自身会 cd $(dirname $0)）；probe_active.py 是手工排障探针，
+          # 保留 scripts/ 子目录，与镜像内 /app/scripts 结构一致。
           case "${{ matrix.goos }}" in
             windows)
               NAME="wb2api-panel-v${V}-windows-amd64.zip"
-              zip -q "$NAME" wb2api.exe config.example.json README.md
+              zip -q "$NAME" wb2api.exe signin_bin.exe login.exe credit.exe \
+                login.sh signin.sh credit.sh scripts/probe_active.py \
+                config.example.json README.md
               ;;
             *)
               NAME="wb2api-panel-v${V}-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz"
-              tar czf "$NAME" wb2api config.example.json README.md
+              tar czf "$NAME" wb2api signin_bin login credit \
+                login.sh signin.sh credit.sh scripts/probe_active.py \
+                config.example.json README.md
               ;;
           esac
           echo "name=$NAME" >> "$GITHUB_ENV"
+          if [[ "$NAME" == *.zip ]]; then unzip -l "$NAME"; else tar tzf "$NAME"; fi
 
       - uses: actions/upload-artifact@v4
         with:
@@ -108,7 +122,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # 取历史 tag 算 compare 链接
+          fetch-depth: 0     # 取完整历史算 compare 链接
+          fetch-tags: true   # 只给 fetch-depth 不够：默认不拉 tag 引用，git describe 会拿到空值
       - name: tag 与源码版本一致性断言
         run: |
           SRC=$(grep -oP 'appVersion = "\K[^"]+' cmd/server/main.go)
@@ -133,26 +148,30 @@ jobs:
         run: |
           PREV=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || true)
           echo "prev=${PREV}" >> "$GITHUB_OUTPUT"
-      # 更新日志正文从 CHANGELOG.md 提取对应章节（"## vX.Y.Z" 起头，下一个 "## " 结尾）。
-      # 章节缺失（忘写/旧 tag 重发）时兜底为原通用模板，保证发布永不因缺章节而失败。
-      - name: 组装更新日志（CHANGELOG.md 章节）
+      - name: 生成 Release 说明
         run: |
-          if [ -f CHANGELOG.md ]; then
-            awk -v start="## ${GITHUB_REF_NAME}" \
-              'index($0, start) == 1 { flag = 1; next } flag && /^## / { exit } flag { print }' \
-              CHANGELOG.md > release-notes.md
-          fi
-          if [ ! -s release-notes.md ]; then
-            {
-              echo "CI 自动构建发布（五平台二进制 + checksums）。"
-              echo ""
-              echo "完整变更：https://github.com/${{ github.repository }}/compare/${{ steps.prev.outputs.prev }}...${{ github.ref_name }}"
-            } > release-notes.md
-          fi
-          cat release-notes.md
+          # README「更新记录」是版本说明的唯一来源，标题格式：### vX.Y.Z · YYYY-MM-DD。
+          awk -v heading="### ${GITHUB_REF_NAME} " '
+            index($0, heading) == 1 { found = 1; next }
+            found && /^### / { exit }
+            found { print }
+          ' README.md > "$RUNNER_TEMP/version-notes.md"
+          {
+            if [ -s "$RUNNER_TEMP/version-notes.md" ]; then
+              cat "$RUNNER_TEMP/version-notes.md"
+            else
+              printf 'CI 自动构建发布（五平台二进制 + checksums）。\n'
+            fi
+            printf '\n---\n\n五平台二进制与 checksums 由 CI 构建。\n'
+            if [ -n "${{ steps.prev.outputs.prev }}" ]; then
+              printf '\n完整变更：https://github.com/%s/compare/%s...%s\n' \
+                "${{ github.repository }}" "${{ steps.prev.outputs.prev }}" "${{ github.ref_name }}"
+            fi
+          } > "$RUNNER_TEMP/release-body.md"
+          cat "$RUNNER_TEMP/release-body.md"
       - uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}-panel
           prerelease: ${{ contains(github.ref_name, '-') }}
-          body_path: release-notes.md
+          body_path: ${{ runner.temp }}/release-body.md
           files: dist/*
