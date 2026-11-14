@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 func (h *Handler) withAnthropicAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -536,7 +537,17 @@ func chatCompletionToMessage(obj map[string]any) map[string]any {
 			content = append(content, map[string]any{"type": "thinking", "thinking": rc})
 		}
 		if text := messageText(msg["content"]); text != "" {
-			content = append(content, map[string]any{"type": "text", "text": text})
+			// 内联思考标签拆分（issue #194）：上游 parser 偶发把整段 CoT 当 content
+			// 下发，正文首尾带 <think:SUF>/</think:SUF>。非流式一次性拆成两段，
+			// 否则 Anthropic 客户端会把控制 token 当正文显示。
+			if think, body := upstream.SplitThinkTags(text); think != "" {
+				content = append(content, map[string]any{"type": "thinking", "thinking": think})
+				if body != "" {
+					content = append(content, map[string]any{"type": "text", "text": body})
+				}
+			} else if body != "" {
+				content = append(content, map[string]any{"type": "text", "text": body})
+			}
 		}
 		if tcs, ok := msg["tool_calls"].([]any); ok {
 			for _, tci := range tcs {
@@ -706,7 +717,11 @@ type messagesWriter struct {
 	// prelude 服务端工具块（server_tool_use / web_search_tool_result，见 searchtool.go）：
 	// 只能在 message_start 之后、正文之前落地，且占用正文之前的内容块下标。
 	prelude []any
-	x       anthState
+	// thinkTag 正文里漏出的 <think:SUF> 标签拆分器（见 upstream/thinktag.go）：
+	// 上游 reasoning parser 偶发把整段 CoT 当 content 下发，Anthropic 客户端只认
+	// content_block.type=thinking，内联标签一律当文本显示。零值可用。
+	thinkTag upstream.ThinkTag
+	x        anthState
 }
 
 type anthState struct {
@@ -896,14 +911,31 @@ func (w *messagesWriter) handleChunk(obj map[string]any) error {
 			}
 		}
 		if s, ok := d["content"].(string); ok && s != "" {
-			if err := w.ensureText(); err != nil {
-				return err
+			// 内联思考标签拆分（issue #194）：上游 parser 偶发把 CoT 当 content 下发，
+			// 正文首尾带 <think:SUF>/</think:SUF>。按 thinking / text 两路发出去，
+			// 而不是让 Anthropic 客户端把控制 token 当正文显示。
+			think, text := w.thinkTag.Feed(s)
+			if think != "" {
+				if err := w.ensureThinking(); err != nil {
+					return err
+				}
+				if err := w.emit("content_block_delta", map[string]any{
+					"index": w.x.thinkIdx,
+					"delta": map[string]any{"type": "thinking_delta", "thinking": think},
+				}); err != nil {
+					return err
+				}
 			}
-			if err := w.emit("content_block_delta", map[string]any{
-				"index": w.x.textIdx,
-				"delta": map[string]any{"type": "text_delta", "text": s},
-			}); err != nil {
-				return err
+			if text != "" {
+				if err := w.ensureText(); err != nil {
+					return err
+				}
+				if err := w.emit("content_block_delta", map[string]any{
+					"index": w.x.textIdx,
+					"delta": map[string]any{"type": "text_delta", "text": text},
+				}); err != nil {
+					return err
+				}
 			}
 		}
 		if tcs, ok := d["tool_calls"].([]any); ok {
