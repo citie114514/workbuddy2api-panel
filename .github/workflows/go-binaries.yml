@@ -1,13 +1,13 @@
 name: go-binaries
 
 # 可运行二进制构建/发布：
-#   - PR / push integrated → 测试 + 五平台编译验证（产物仅存 artifact，不发布）
+#   - PR / push main → 测试 + 五平台编译验证（产物仅存 artifact，不发布）
 #   - push v* tag    → 同上 + 打包上传到 GitHub Release（zip/tar.gz + checksums）
 # 发布校验：-s -w 剥离、二进制版本串 == 源码 appVersion、tag 版本 == 源码版本
 # （-ci 后缀的测试 tag 豁免，用于演练发布线）。
 on:
   push:
-    branches: [integrated]
+    branches: [main]
     tags: ["v*"]
   pull_request:
     paths:
@@ -150,12 +150,14 @@ jobs:
           echo "prev=${PREV}" >> "$GITHUB_OUTPUT"
       - name: 生成 Release 说明
         run: |
-          # README「更新记录」是版本说明的唯一来源，标题格式：### vX.Y.Z · YYYY-MM-DD。
-          awk -v heading="### ${GITHUB_REF_NAME} " '
+          # CHANGELOG.md 是版本说明的唯一来源（标题格式：## vX.Y.Z（YYYY-MM-DD），
+          # 下一个 "## " 结尾）。README 只保留「与上游的差异」概览表，不做逐版日志，
+          # 故这里必须读 CHANGELOG.md —— 读 README 会永远拿不到章节、退化成通用模板。
+          awk -v heading="## ${GITHUB_REF_NAME}" '
             index($0, heading) == 1 { found = 1; next }
-            found && /^### / { exit }
+            found && /^## / { exit }
             found { print }
-          ' README.md > "$RUNNER_TEMP/version-notes.md"
+          ' CHANGELOG.md > "$RUNNER_TEMP/version-notes.md"
           {
             if [ -s "$RUNNER_TEMP/version-notes.md" ]; then
               cat "$RUNNER_TEMP/version-notes.md"

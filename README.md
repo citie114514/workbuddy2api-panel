@@ -30,6 +30,8 @@
 > **维护方式披露**：本 fork 的 issue / PR 处置、代码审查、测试与修复实现**由多个 AI 编码 agent（以 pi、Claude Code 为主，ZCode 等为辅）完成**，合并与发布决策由仓库所有者 [@citie114514](https://github.com/citie114514) 作出。请知悉后再使用或参与贡献。
 
 > **项目沿革**：[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)（已删库）→ [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)（面板增强分支，2026-10-21 停止维护）→ **本仓库（继任维护）**。
+>
+> **代码基线与最新修改参考**：自 **v1.17.0** 起，本仓库的代码基线换成了 [zx-yk/workbuddy2api-panel](https://github.com/zx-yk/workbuddy2api-panel) 的 `integrated` 分支（同样以上游 `73a7560` 为共同祖先，v1.16.30）——该分支持续跟进上游停更后的协议变化（出站形态、保活、限流预算、调度），本仓库在此基础上叠加自有修复。另参考了 [jin66god/workbuddy2api-panel](https://github.com/jin66god/workbuddy2api-panel) 与 [misakano7545/workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel) 的单项实现（输出预算下限、reasoning 镜像、Kimi `$ref` 展开、11140 连坐保护、内联思考标签等），逐项移植并在本仓库独立验证。**这些参考不构成官方继承关系**，各分支的维护状态与质量需自行评估。
 > 面板分支已完整吸收 Sliverkiss 删库前的最后一次更新（`ea8b1e5`），并在其基础上重构了可视化运维层；差异概览见 [与上游的差异](#-与上游的差异)，上游设计的精巧之处（账号池调度、错误分类、提示词体系）原样保留，详见下文。
 
 > ⚠️ **本项目仅限自用账号（签到 / 保活 / 个人工具接入），不支持同时也是禁止批量小号分发额度、二次打包或收费售卖。** 详见 [使用声明（必读）](#使用声明必读)。
@@ -206,6 +208,7 @@ WorkBuddy2API 是一个自托管的**多协议反向代理网关**，将腾讯 C
 
 | 版本 | 变更 |
 |---|---|
+| v1.17.0（2026-11-14） | **代码基线换到 zx-yk `integrated` v1.16.30**（同源上游 `73a7560`，并入 96 个提交：出站形态对齐官方 5.9.3→5.11.3、TLS ClientHello 复刻、流式保活提前到首字节前、429 不吃换号预算、CN 对话主域回 `www.workbuddy.cn`、请求级错误不再解绑会话粘性、任务错峰与风控告警等）。**协议层改用 integrated 的 `/v1/responses` + `/v1/messages`**（与保活/粘性/预算/thinking 块已打通），本仓库自有的适配层退役。叠加 10 项跨分支移植：11140 风控连坐保护（命中即停手 + 多号被限则全池暂停）、摘掉漏进正文的 `<think:SUF>` 内联思考标签、接受上游「整条 message」帧（此前整帧被丢）、空 text 段补位（含「字符串被嗅探成 parts」）、入站请求体 64MiB 护栏、输出预算下限、非 deepseek 家族 reasoning 镜像、CN Kimi 工具 `$ref` 展开、6004 付费兄弟回退、11115 可修复重发 |
 | v1.16.1（2026-10-27） | 修复工具结果图片透传：/v1/responses 的 `function_call_output` 数组逐块分流（`input_image`/`input_image_url` → image_url 图片区块，文本转 text），/v1/messages 的 `tool_result` 图片块转 data URL 透传（此前丢弃）—— Codex/Claude Code 看图成本从百万 token/张级降到正常计量 |
 | v1.16.0（2026-10-25） | 修复 Responses / Anthropic 适配层**吞思维链与缓存计量**：/v1/messages 补 thinking 块（thinking_delta + signature 占位）与 `usage.cache_read/cache_creation_input_tokens`；/v1/responses 补 reasoning 输出项（受 `reasoning.summary` 控制）与 `output_tokens_details.reasoning_tokens`、`input_tokens_details.cached_tokens`；chat 路径本来就全、不动 |
 | v1.15.0（2026-10-25） | 新增**模型付费回退**（默认开启）：免费额度型模型额度用尽后上游报 6004 模型级限流，官方客户端此时自动切到同名付费兄弟型号（`global:deepseek-v4.1-flash` x0.00 → `-sg` x0.03）继续可用；网关对齐 —— 模型级阻塞且目录存在 `-sg` 型号时改用回退型号重选一次，计费按回退型号真实倍率。`pool.model_fallback_enabled` 开关 + `pool.model_fallback` 自定义映射（键 `"realm:model"`，值空串=禁用该模型回退），热生效 |
@@ -1031,11 +1034,15 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 ### 多图会话请求体超限怎么办？
 
-网关**不再设请求体上限**（`server.max_body_mb` 已移除，对齐上游）：任意大小的请求体都会完整读入并转发上游，超限类问题由上游自然返回错误——其响应信息量更大（能看到上游的真实策略），网关不再以 413 提前拦截。
+网关**没有内容策略上的请求体上限**（旧的 `server.max_body_mb` 8MB 紧上限已移除）：多图 / 长上下文会话（历史图片每轮以 base64 重发，编码再膨胀约 37%）不会撞网关侧 413，超限类问题由上游自然返回错误——其响应信息量更大（能看到上游的真实策略）。
 
-- 多图/长上下文会话（历史图片每轮以 base64 重发，编码再膨胀约 37%）不会再撞网关侧 413
+**但保留了一道进程存活护栏** `server.max_payload_bytes`（默认 64MiB，可配 8–512MiB）：`io.ReadAll` 无界时，一次几百 MB 的上传就能把小内存机器上的网关连同伴生面板一起 OOM。两者不冲突——护栏刻意远高于真实会话量级（长会话多图实测在几 MB），只挡能把进程读死的上传。
+
+- 超过 `max_payload_bytes` → `413 payload_too_large`（Anthropic 端点按 Anthropic 错误形状回）。**先排空有限字节再回 413**，否则 net/http 会直接关连接，客户端只看到 connection reset、看不到这份 413
+- 护栏之下的任意大小请求体完整读入并转发，不提前拦截
 - 若上游真的返回 413/超限错误，网关按既有错误分类链路如实透传（不打码、不罚号——超限是请求侧问题）
 - 客户端中途断流导致的半截 body 在读入阶段即报 `400 invalid_request`，不会把截断 JSON 喂给上游（issue #41 语义保留在读错误路径）
+- 读体耗时 >3s 打一条 WARN（只记路径/字节数/耗时/声明的长度，不含内容）：此前「上传慢」与「请求根本没到本进程」在日志上无法区分
 
 ### 上游报 11115「prompt is too long」但其实没那么长？
 
@@ -1091,7 +1098,7 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 断言 | 出处 |
 |---|---|
 | `prompt.mode` 默认 `custom` | `cmd/server/config.go:148` |
-| 请求体无网关侧上限（max_body_mb 已移除） | `internal/server/handler.go` chatCompletions 读 body 段 |
+| 请求体无内容策略上限，仅 `server.max_payload_bytes` 进程护栏（默认 64MiB） | `internal/server/bodylimit.go` readBody |
 | 出站强制 `stream:true` | `internal/upstream/payload.go:28` |
 | DeepSeek 思维链注入（`thinking.type=enabled`） | `internal/upstream/thinking.go:110` |
 | 默认 `reasoning_effort` 档位 = `high` | `internal/upstream/thinking.go:32` |
